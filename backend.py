@@ -66,7 +66,7 @@ PROZORRO_API = "https://public-api.prozorro.gov.ua/api/2.5"
 
 async def search_prozorro_tenders(keywords=None, cpv=None, region=None, min_amount=None, max_amount=None):
     params = {"descending": "1", "limit": "100"}
-    date_from = (datetime.now() - timedelta(days=7)).isoformat()
+    date_from = (datetime.now() - timedelta(days=30)).isoformat()
     params["offset"] = date_from
     
     print(f"🔍 ФІЛЬТР: keywords='{keywords}', cpv='{cpv}', region='{region}', сума={min_amount}-{max_amount}")
