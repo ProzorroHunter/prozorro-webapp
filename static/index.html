@@ -1,1 +1,429 @@
-
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🎯 ProzorroHunter</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 100%);
+            color: #fff;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container { max-width: 1200px; margin: 0 auto; }
+        
+        /* Glassmorphism */
+        .glass {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 16px;
+            box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
+        }
+        
+        /* Header */
+        .header {
+            padding: 30px;
+            margin-bottom: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 2.5rem;
+            background: linear-gradient(135deg, #6366f1, #ec4899);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 10px;
+        }
+        
+        /* Stats */
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .stat-card {
+            padding: 20px;
+            text-align: center;
+        }
+        
+        .stat-value {
+            font-size: 2rem;
+            font-weight: bold;
+            color: #6366f1;
+        }
+        
+        .stat-label {
+            font-size: 0.9rem;
+            color: rgba(255, 255, 255, 0.7);
+            margin-top: 5px;
+        }
+        
+        /* Buttons */
+        .btn {
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(99, 102, 241, 0.5);
+        }
+        
+        /* Filters */
+        .filters-section {
+            margin-bottom: 30px;
+        }
+        
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        
+        .filters-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .filter-card {
+            padding: 20px;
+        }
+        
+        .filter-card h3 {
+            margin-bottom: 10px;
+        }
+        
+        .filter-tag {
+            display: inline-block;
+            padding: 5px 10px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 5px;
+            font-size: 0.85rem;
+            margin: 5px 5px 5px 0;
+        }
+        
+        /* Table */
+        .table-container {
+            padding: 20px;
+            overflow-x: auto;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        th {
+            color: rgba(255, 255, 255, 0.7);
+            font-size: 0.9rem;
+        }
+        
+        tr:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+        
+        /* Modal */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(5px);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .modal.active { display: flex; }
+        
+        .modal-content {
+            background: rgba(26, 26, 46, 0.95);
+            padding: 30px;
+            border-radius: 16px;
+            max-width: 500px;
+            width: 90%;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .form-group {
+            margin-bottom: 15px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            color: rgba(255, 255, 255, 0.8);
+        }
+        
+        .form-group input {
+            width: 100%;
+            padding: 10px;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            background: rgba(255, 255, 255, 0.05);
+            color: white;
+        }
+        
+        .form-actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+        }
+        
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+        
+        .amount { color: #10b981; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header glass">
+            <h1>🎯 ProzorroHunter</h1>
+            <p>Автоматичний моніторинг тендерів Prozorro 24/7</p>
+        </div>
+        
+        <!-- Stats -->
+        <div class="stats">
+            <div class="stat-card glass">
+                <div class="stat-value" id="totalTenders">0</div>
+                <div class="stat-label">Всього тендерів</div>
+            </div>
+            <div class="stat-card glass">
+                <div class="stat-value" id="todayTenders">0</div>
+                <div class="stat-label">Сьогодні</div>
+            </div>
+            <div class="stat-card glass">
+                <div class="stat-value" id="activeFilters">0</div>
+                <div class="stat-label">Активних фільтрів</div>
+            </div>
+        </div>
+        
+        <!-- Filters -->
+        <div class="filters-section">
+            <div class="section-header">
+                <h2>📋 Мої Фільтри</h2>
+                <button class="btn" onclick="openModal()">➕ Створити фільтр</button>
+            </div>
+            <div class="filters-grid" id="filtersGrid"></div>
+        </div>
+        
+        <!-- Tenders Table -->
+        <div class="table-container glass">
+            <h2 style="margin-bottom: 20px;">📊 Знайдені Тендери</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Назва</th>
+                        <th>Замовник</th>
+                        <th>Сума</th>
+                        <th>Регіон</th>
+                        <th>Дата</th>
+                        <th>Дії</th>
+                    </tr>
+                </thead>
+                <tbody id="tendersTable"></tbody>
+            </table>
+        </div>
+    </div>
+    
+    <!-- Modal -->
+    <div class="modal" id="filterModal">
+        <div class="modal-content glass">
+            <h2>Створити новий фільтр</h2>
+            <form id="filterForm">
+                <div class="form-group">
+                    <label>Назва фільтра</label>
+                    <input type="text" id="filterName" required placeholder="Комп'ютерна техніка">
+                </div>
+                <div class="form-group">
+                    <label>Ключові слова</label>
+                    <input type="text" id="filterKeywords" placeholder="ноутбук, комп'ютер">
+                </div>
+                <div class="form-group">
+                    <label>CPV код</label>
+                    <input type="text" id="filterCpv" placeholder="30200000-1">
+                </div>
+                <div class="form-group">
+                    <label>Регіон</label>
+                    <input type="text" id="filterRegion" placeholder="Київська область">
+                </div>
+                <div class="form-group">
+                    <label>Мін. сума (грн)</label>
+                    <input type="number" id="filterMinAmount" placeholder="50000">
+                </div>
+                <div class="form-group">
+                    <label>Макс. сума (грн)</label>
+                    <input type="number" id="filterMaxAmount" placeholder="500000">
+                </div>
+                <div class="form-actions">
+                    <button type="button" class="btn-secondary" onclick="closeModal()">Скасувати</button>
+                    <button type="submit" class="btn">✨ Створити</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <script>
+        // Завантаження даних
+        async function loadData() {
+            await loadStats();
+            await loadFilters();
+            await loadTenders();
+        }
+        
+        async function loadStats() {
+            try {
+                const res = await fetch('/api/stats');
+                const data = await res.json();
+                document.getElementById('totalTenders').textContent = data.total;
+                document.getElementById('todayTenders').textContent = data.today;
+                document.getElementById('activeFilters').textContent = data.active;
+            } catch (e) {
+                console.error('Помилка завантаження статистики:', e);
+            }
+        }
+        
+        async function loadFilters() {
+            try {
+                const res = await fetch('/api/filters');
+                const filters = await res.json();
+                const grid = document.getElementById('filtersGrid');
+                grid.innerHTML = filters.map(f => `
+                    <div class="filter-card glass">
+                        <h3>${f.name}</h3>
+                        ${f.keywords ? `<div class="filter-tag">🔑 ${f.keywords}</div>` : ''}
+                        ${f.cpv ? `<div class="filter-tag">📦 CPV: ${f.cpv}</div>` : ''}
+                        ${f.region ? `<div class="filter-tag">📍 ${f.region}</div>` : ''}
+                        ${f.minAmount || f.maxAmount ? `<div class="filter-tag">💰 ${f.minAmount || '0'} - ${f.maxAmount || '∞'} грн</div>` : ''}
+                        <div style="margin-top: 10px;">
+                            <span class="filter-tag">Знайдено: ${f.foundCount || 0}</span>
+                        </div>
+                    </div>
+                `).join('');
+            } catch (e) {
+                console.error('Помилка завантаження фільтрів:', e);
+            }
+        }
+        
+        async function loadTenders() {
+            try {
+                const res = await fetch('/api/tenders');
+                const tenders = await res.json();
+                const table = document.getElementById('tendersTable');
+                table.innerHTML = tenders.map(t => `
+                    <tr>
+                        <td>
+                            <div>${t.title}</div>
+                            ${t.cpv ? `<small style="color: rgba(255,255,255,0.5);">CPV: ${t.cpv}</small>` : ''}
+                        </td>
+                        <td>${t.procuringEntity}</td>
+                        <td class="amount">${formatAmount(t.amount)}</td>
+                        <td>${t.region || '-'}</td>
+                        <td>${formatDate(t.datePublished)}</td>
+                        <td><a href="${t.url}" target="_blank" style="color: #6366f1;">Відкрити →</a></td>
+                    </tr>
+                `).join('');
+            } catch (e) {
+                console.error('Помилка завантаження тендерів:', e);
+            }
+        }
+        
+        function formatAmount(amount) {
+            return new Intl.NumberFormat('uk-UA', { 
+                style: 'currency', 
+                currency: 'UAH',
+                minimumFractionDigits: 0 
+            }).format(amount);
+        }
+        
+        function formatDate(dateString) {
+            return new Date(dateString).toLocaleString('uk-UA', {
+                year: 'numeric',
+                month: 'short',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit'
+            });
+        }
+        
+        // Modal
+        function openModal() {
+            document.getElementById('filterModal').classList.add('active');
+        }
+        
+        function closeModal() {
+            document.getElementById('filterModal').classList.remove('active');
+            document.getElementById('filterForm').reset();
+        }
+        
+        // Створення фільтра
+        document.getElementById('filterForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const filter = {
+                name: document.getElementById('filterName').value,
+                keywords: document.getElementById('filterKeywords').value || null,
+                cpv: document.getElementById('filterCpv').value || null,
+                region: document.getElementById('filterRegion').value || null,
+                minAmount: parseFloat(document.getElementById('filterMinAmount').value) || null,
+                maxAmount: parseFloat(document.getElementById('filterMaxAmount').value) || null
+            };
+            
+            try {
+                const res = await fetch('/api/filters', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(filter)
+                });
+                
+                if (res.ok) {
+                    alert('✅ Фільтр створено!');
+                    closeModal();
+                    loadData();
+                }
+            } catch (e) {
+                alert('❌ Помилка створення фільтра');
+            }
+        });
+        
+        // Автооновлення кожні 30 секунд
+        setInterval(loadData, 30000);
+        
+        // Початкове завантаження
+        loadData();
+    </script>
+</body>
+</html>
