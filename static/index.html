@@ -88,6 +88,19 @@
             background: linear-gradient(135deg, #10b981, #059669);
         }
         
+        .btn-danger {
+            background: linear-gradient(135deg, #ef4444, #dc2626);
+        }
+        
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+        
         .filters-section {
             margin-bottom: 30px;
         }
@@ -110,10 +123,35 @@
         
         .filter-card {
             padding: 20px;
+            position: relative;
         }
         
         .filter-card h3 {
             margin-bottom: 10px;
+            padding-right: 30px;
+        }
+        
+        .filter-delete {
+            position: absolute;
+            top: 15px;
+            right: 15px;
+            background: rgba(239, 68, 68, 0.2);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: #ef4444;
+            width: 28px;
+            height: 28px;
+            border-radius: 6px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            transition: all 0.3s;
+        }
+        
+        .filter-delete:hover {
+            background: rgba(239, 68, 68, 0.4);
+            transform: scale(1.1);
         }
         
         .filter-tag {
@@ -207,6 +245,21 @@
             overflow-y: auto;
         }
         
+        .confirm-modal {
+            max-width: 400px;
+            text-align: center;
+        }
+        
+        .confirm-modal h2 {
+            margin-bottom: 15px;
+            color: #ef4444;
+        }
+        
+        .confirm-modal p {
+            margin-bottom: 20px;
+            color: rgba(255, 255, 255, 0.7);
+        }
+        
         .form-group {
             margin-bottom: 15px;
         }
@@ -237,15 +290,6 @@
             display: flex;
             gap: 10px;
             margin-top: 20px;
-        }
-        
-        .btn-secondary {
-            background: rgba(255, 255, 255, 0.1);
-            color: white;
-            border: none;
-            padding: 12px 24px;
-            border-radius: 8px;
-            cursor: pointer;
         }
         
         .amount { color: #10b981; font-weight: bold; }
@@ -340,6 +384,7 @@
         </div>
     </div>
     
+    <!-- Create Filter Modal -->
     <div class="modal" id="filterModal">
         <div class="modal-content glass">
             <h2>Створити новий фільтр</h2>
@@ -414,7 +459,7 @@
                 
                 <div class="form-group">
                     <label>Період пошуку</label>
-                    <select id="filterPeriod" onchange="updatePeriodDays()">
+                    <select id="filterPeriod">
                         <option value="7">Тиждень (7 днів)</option>
                         <option value="30" selected>Місяць (30 днів)</option>
                         <option value="90">Квартал (90 днів)</option>
@@ -441,7 +486,21 @@
         </div>
     </div>
     
+    <!-- Confirm Delete Modal -->
+    <div class="modal" id="confirmModal">
+        <div class="modal-content glass confirm-modal">
+            <h2>⚠️ Видалити фільтр?</h2>
+            <p id="confirmText">Ви впевнені що хочете видалити цей фільтр?</p>
+            <div class="form-actions" style="justify-content: center;">
+                <button class="btn-secondary" onclick="closeConfirm()">Скасувати</button>
+                <button class="btn btn-danger" onclick="confirmDelete()">Видалити</button>
+            </div>
+        </div>
+    </div>
+    
     <script>
+        let deleteFilterId = null;
+        
         async function loadData() {
             await loadStats();
             await loadFilters();
@@ -465,8 +524,15 @@
                 const res = await fetch('/api/filters');
                 const filters = await res.json();
                 const grid = document.getElementById('filtersGrid');
+                
+                if (filters.length === 0) {
+                    grid.innerHTML = '<p style="color: rgba(255,255,255,0.5); padding: 40px; text-align: center; grid-column: 1/-1;">Фільтрів ще немає. Створіть перший фільтр!</p>';
+                    return;
+                }
+                
                 grid.innerHTML = filters.map(f => `
                     <div class="filter-card glass">
+                        <div class="filter-delete" onclick="askDeleteFilter(${f.id}, '${f.name}')" title="Видалити фільтр">×</div>
                         <h3>${f.name}</h3>
                         ${f.keywords ? `<div class="filter-tag">🔑 ${f.keywords}</div>` : ''}
                         ${f.cpv ? `<div class="filter-tag">📦 CPV: ${f.cpv}</div>` : ''}
@@ -538,14 +604,14 @@
             
             try {
                 const response = await fetch(`/api/tender/${tenderId}`);
+                const data = await response.json();
                 
-                if (!response.ok) {
+                if (data.error) {
                     showNotification('❌ Тендер не знайдено', 'error');
                     return;
                 }
                 
-                const tender = await response.json();
-                window.open(tender.url, '_blank');
+                window.open(data.url, '_blank');
                 showNotification('✅ Тендер знайдено! Відкрито в новій вкладці');
                 
             } catch (e) {
@@ -558,25 +624,36 @@
             showNotification('🔍 Запускаю пошук...', 'info');
             
             try {
-                const response = await fetch(`/api/filters/${filterId}/search`, {
-                    method: 'POST'
-                });
-                
-                if (response.ok) {
-                    showNotification('✅ Пошук запущено! Оновлюю дані...');
-                    setTimeout(() => {
-                        loadData();
-                    }, 3000);
-                } else {
-                    showNotification('⏳ Пошук може зайняти час. Спробуйте оновити через хвилину.', 'info');
-                }
+                await fetch(`/api/filters/${filterId}/search`, { method: 'POST' });
+                showNotification('✅ Пошук запущено! Оновлюю дані через 5 сек...');
+                setTimeout(() => loadData(), 5000);
             } catch (e) {
                 showNotification('⏳ Пошук запущено в фоні. Оновіть сторінку через хвилину.', 'info');
             }
         }
         
-        function updatePeriodDays() {
-            // Додаткова функція для майбутнього розширення
+        function askDeleteFilter(id, name) {
+            deleteFilterId = id;
+            document.getElementById('confirmText').textContent = `Видалити фільтр "${name}"?`;
+            document.getElementById('confirmModal').classList.add('active');
+        }
+        
+        async function confirmDelete() {
+            if (!deleteFilterId) return;
+            
+            try {
+                await fetch(`/api/filters/${deleteFilterId}`, { method: 'DELETE' });
+                showNotification('✅ Фільтр видалено');
+                closeConfirm();
+                loadData();
+            } catch (e) {
+                showNotification('❌ Помилка видалення', 'error');
+            }
+        }
+        
+        function closeConfirm() {
+            document.getElementById('confirmModal').classList.remove('active');
+            deleteFilterId = null;
         }
         
         function formatAmount(amount) {
@@ -618,7 +695,6 @@
                 supplier: document.getElementById('filterSupplier').value || null,
                 minAmount: parseFloat(document.getElementById('filterMinAmount').value) || null,
                 maxAmount: parseFloat(document.getElementById('filterMaxAmount').value) || null,
-                periodType: 'custom',
                 periodDays: parseInt(document.getElementById('filterPeriod').value) || 30
             };
             
@@ -632,7 +708,7 @@
                 if (res.ok) {
                     showNotification('✅ Фільтр створено! Пошук запущено...');
                     closeModal();
-                    setTimeout(() => loadData(), 2000);
+                    setTimeout(() => loadData(), 3000);
                 }
             } catch (e) {
                 showNotification('❌ Помилка створення фільтра', 'error');
