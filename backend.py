@@ -12,7 +12,6 @@ import os
 
 app = FastAPI(title="ProzorroHunter API")
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,7 +20,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# База даних
 def init_db():
     conn = sqlite3.connect('prozorro.db')
     c = conn.cursor()
@@ -55,7 +53,6 @@ def init_db():
 
 init_db()
 
-# Models
 class FilterCreate(BaseModel):
     name: str
     keywords: Optional[str] = None
@@ -64,12 +61,11 @@ class FilterCreate(BaseModel):
     minAmount: Optional[float] = None
     maxAmount: Optional[float] = None
 
-# Prozorro API
 PROZORRO_API = "https://public-api.prozorro.gov.ua/api/2.5"
 
 async def search_prozorro_tenders(keywords=None, cpv=None, region=None, min_amount=None, max_amount=None):
-    params = {"descending": "1", "limit": "50"}
-    date_from = (datetime.now() - timedelta(days=1)).isoformat()
+    params = {"descending": "1", "limit": "100"}
+    date_from = (datetime.now() - timedelta(days=7)).isoformat()  # Збільшили до 7 днів
     params["offset"] = date_from
     
     try:
@@ -79,7 +75,7 @@ async def search_prozorro_tenders(keywords=None, cpv=None, region=None, min_amou
             data = response.json()
             
             tenders = []
-            for tender_data in data.get("data", [])[:10]:  # Тільки 10 для швидкості
+            for tender_data in data.get("data", [])[:20]:
                 tender_id = tender_data.get("id")
                 try:
                     detail_response = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
@@ -99,10 +95,16 @@ async def search_prozorro_tenders(keywords=None, cpv=None, region=None, min_amou
                         "url": f"https://prozorro.gov.ua/tender/{tender_id}"
                     }
                     tenders.append(tender)
-                except:
+                    
+                    if len(tenders) >= 5:  # Максимум 5 тендерів
+                        break
+                except Exception as e:
+                    print(f"Помилка тендера {tender_id}: {e}")
                     continue
+                    
             return tenders
-    except:
+    except Exception as e:
+        print(f"Помилка пошуку: {e}")
         return []
 
 def matches_filter(tender, keywords, cpv, region, min_amount, max_amount):
@@ -126,7 +128,6 @@ def matches_filter(tender, keywords, cpv, region, min_amount, max_amount):
         return False
     return True
 
-# API Endpoints
 @app.get("/")
 async def root():
     return FileResponse('static/index.html')
@@ -166,6 +167,12 @@ async def create_filter(filter_data: FilterCreate, background_tasks: BackgroundT
     
     background_tasks.add_task(check_filter, filter_id)
     return {"id": filter_id, "message": "Фільтр створено"}
+
+@app.post("/api/filters/{filter_id}/search")
+async def search_filter_now(filter_id: int, background_tasks: BackgroundTasks):
+    """Ручний запуск пошуку для фільтра"""
+    background_tasks.add_task(check_filter, filter_id)
+    return {"message": "Пошук запущено"}
 
 @app.delete("/api/filters/{filter_id}")
 async def delete_filter(filter_id: int):
@@ -209,6 +216,7 @@ async def get_stats():
     return {"total": total, "today": today_count, "active": active_filters}
 
 async def check_filter(filter_id: int):
+    """Перевірка фільтра та пошук нових тендерів"""
     conn = sqlite3.connect('prozorro.db')
     c = conn.cursor()
     c.execute('SELECT keywords, cpv, region, min_amount, max_amount FROM filters WHERE id = ?', (filter_id,))
@@ -217,6 +225,7 @@ async def check_filter(filter_id: int):
         conn.close()
         return
     
+    print(f"🔍 Шукаю тендери для фільтра {filter_id}...")
     tenders = await search_prozorro_tenders(filter_data[0], filter_data[1], filter_data[2], filter_data[3], filter_data[4])
     
     new_count = 0
@@ -234,8 +243,8 @@ async def check_filter(filter_id: int):
     c.execute('UPDATE filters SET found_count = found_count + ? WHERE id = ?', (new_count, filter_id))
     conn.commit()
     conn.close()
+    print(f"✅ Фільтр {filter_id}: знайдено {new_count} нових тендерів")
 
-# Монтуємо статичні файли
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 if __name__ == "__main__":
