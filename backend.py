@@ -9,6 +9,7 @@ import asyncio
 from datetime import datetime, timedelta
 import sqlite3
 import os
+import traceback
 
 app = FastAPI(title="ProzorroHunter API")
 
@@ -68,20 +69,28 @@ async def search_prozorro_tenders(keywords=None, cpv=None, region=None, min_amou
     date_from = (datetime.now() - timedelta(days=7)).isoformat()
     params["offset"] = date_from
     
+    print(f"🔍 Пошук тендерів з параметрами: keywords={keywords}, cpv={cpv}, region={region}")
+    
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(f"{PROZORRO_API}/tenders", params=params)
             response.raise_for_status()
             data = response.json()
             
+            print(f"📊 Prozorro API повернув {len(data.get('data', []))} тендерів")
+            
             tenders = []
-            for tender_data in data.get("data", [])[:20]:
+            checked = 0
+            for tender_data in data.get("data", [])[:30]:  # Збільшили до 30
                 tender_id = tender_data.get("id")
+                checked += 1
+                
                 try:
                     detail_response = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
                     detail_data = detail_response.json().get("data", {})
                     
-                    if not matches_filter(detail_data, keywords, cpv, region, min_amount, max_amount):
+                    # М'якша перевірка - OR замість AND
+                    if not matches_filter_soft(detail_data, keywords, cpv, region, min_amount, max_amount):
                         continue
                     
                     tender = {
@@ -95,38 +104,66 @@ async def search_prozorro_tenders(keywords=None, cpv=None, region=None, min_amou
                         "url": f"https://prozorro.gov.ua/tender/{tender_id}"
                     }
                     tenders.append(tender)
+                    print(f"✅ Знайдено: {tender['title'][:50]}...")
                     
-                    if len(tenders) >= 5:
+                    if len(tenders) >= 10:  # Збільшили до 10
                         break
+                        
                 except Exception as e:
-                    print(f"Помилка тендера {tender_id}: {e}")
+                    print(f"⚠️ Помилка тендера {tender_id}: {e}")
                     continue
-                    
+            
+            print(f"📈 Перевірено {checked} тендерів, знайдено {len(tenders)} підходящих")
             return tenders
+            
     except Exception as e:
-        print(f"Помилка пошуку: {e}")
+        print(f"❌ Помилка пошуку: {e}")
+        print(traceback.format_exc())
         return []
 
-def matches_filter(tender, keywords, cpv, region, min_amount, max_amount):
+def matches_filter_soft(tender, keywords, cpv, region, min_amount, max_amount):
+    """М'яка перевірка - достатньо хоча б одного критерію"""
+    matches = 0
+    total_criteria = 0
+    
+    # Ключові слова
     if keywords:
+        total_criteria += 1
         title = tender.get("title", "").lower()
         keywords_list = [k.strip().lower() for k in keywords.split(",")]
-        if not any(keyword in title for keyword in keywords_list):
-            return False
+        if any(keyword in title for keyword in keywords_list):
+            matches += 1
+    
+    # CPV
     if cpv:
+        total_criteria += 1
         tender_cpv = tender.get("items", [{}])[0].get("classification", {}).get("id", "")
-        if not tender_cpv.startswith(cpv[:3]):
-            return False
+        if tender_cpv.startswith(cpv[:3]):
+            matches += 1
+    
+    # Регіон
     if region:
+        total_criteria += 1
         tender_region = tender.get("procuringEntity", {}).get("address", {}).get("region", "")
-        if region.lower() not in tender_region.lower():
-            return False
-    amount = tender.get("value", {}).get("amount", 0)
-    if min_amount and amount < min_amount:
-        return False
-    if max_amount and amount > max_amount:
-        return False
-    return True
+        if region.lower() in tender_region.lower():
+            matches += 1
+    
+    # Сума
+    if min_amount or max_amount:
+        total_criteria += 1
+        amount = tender.get("value", {}).get("amount", 0)
+        if (not min_amount or amount >= min_amount) and (not max_amount or amount <= max_amount):
+            matches += 1
+    
+    # Якщо немає критеріїв - приймаємо всі
+    if total_criteria == 0:
+        return True
+    
+    # Достатньо хоча б 1 критерію з 2+ або всіх критеріїв якщо їх 1
+    if total_criteria == 1:
+        return matches >= 1
+    else:
+        return matches >= 1  # М'яке правило
 
 @app.get("/")
 async def root():
@@ -139,15 +176,24 @@ async def health():
 @app.get("/api/tender/{tender_id}")
 async def get_tender_by_id(tender_id: str):
     """Отримати тендер за номером"""
+    print(f"🔍 Запит тендера: {tender_id}")
+    
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
+            url = f"{PROZORRO_API}/tenders/{tender_id}"
+            print(f"📡 Запит до Prozorro: {url}")
+            
+            response = await client.get(url)
+            print(f"📊 Статус відповіді: {response.status_code}")
+            
             if response.status_code == 404:
+                print(f"❌ Тендер не знайдено: {tender_id}")
                 raise HTTPException(status_code=404, detail="Тендер не знайдено")
+            
             response.raise_for_status()
             data = response.json().get("data", {})
             
-            return {
+            result = {
                 "id": tender_id,
                 "title": data.get("title", ""),
                 "procuringEntity": data.get("procuringEntity", {}).get("name", ""),
@@ -155,9 +201,18 @@ async def get_tender_by_id(tender_id: str):
                 "status": data.get("status", ""),
                 "url": f"https://prozorro.gov.ua/tender/{tender_id}"
             }
-    except httpx.HTTPStatusError:
-        raise HTTPException(status_code=404, detail="Тендер не знайдено")
+            
+            print(f"✅ Тендер знайдено: {result['title'][:50]}...")
+            return result
+            
+    except httpx.HTTPStatusError as e:
+        print(f"❌ HTTP помилка: {e.response.status_code}")
+        if e.response.status_code == 404:
+            raise HTTPException(status_code=404, detail="Тендер не знайдено")
+        raise HTTPException(status_code=500, detail=f"Помилка Prozorro API: {e.response.status_code}")
     except Exception as e:
+        print(f"❌ Загальна помилка: {e}")
+        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Помилка: {str(e)}")
 
 @app.get("/api/filters")
@@ -189,12 +244,14 @@ async def create_filter(filter_data: FilterCreate, background_tasks: BackgroundT
     conn.commit()
     conn.close()
     
+    print(f"✅ Створено фільтр #{filter_id}: {filter_data.name}")
     background_tasks.add_task(check_filter, filter_id)
     return {"id": filter_id, "message": "Фільтр створено"}
 
 @app.post("/api/filters/{filter_id}/search")
 async def search_filter_now(filter_id: int, background_tasks: BackgroundTasks):
     """Ручний запуск пошуку для фільтра"""
+    print(f"🚀 Ручний запуск пошуку для фільтра #{filter_id}")
     background_tasks.add_task(check_filter, filter_id)
     return {"message": "Пошук запущено"}
 
