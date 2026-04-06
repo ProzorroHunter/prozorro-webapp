@@ -269,6 +269,10 @@
             background: rgba(239, 68, 68, 0.9);
         }
         
+        .notification.info {
+            background: rgba(59, 130, 246, 0.9);
+        }
+        
         @keyframes slideIn {
             from { transform: translateX(400px); opacity: 0; }
             to { transform: translateX(0); opacity: 1; }
@@ -462,7 +466,7 @@
             }
         }
         
-        // Пошук за номером тендера
+        // Пошук за номером тендера (тепер через backend)
         async function searchByTenderId() {
             const tenderId = document.getElementById('tenderIdSearch').value.trim();
             
@@ -474,18 +478,17 @@
             showNotification('🔍 Шукаю тендер...', 'info');
             
             try {
-                const response = await fetch(`https://public-api.prozorro.gov.ua/api/2.5/tenders/${tenderId}`);
+                const response = await fetch(`/api/tender/${tenderId}`);
                 
                 if (!response.ok) {
                     showNotification('❌ Тендер не знайдено', 'error');
                     return;
                 }
                 
-                const data = await response.json();
-                const tender = data.data;
+                const tender = await response.json();
                 
                 // Відкриваємо тендер в новій вкладці
-                window.open(`https://prozorro.gov.ua/tender/${tenderId}`, '_blank');
+                window.open(tender.url, '_blank');
                 showNotification('✅ Тендер знайдено! Відкрито в новій вкладці');
                 
             } catch (e) {
@@ -499,7 +502,6 @@
             showNotification('🔍 Запускаю пошук...', 'info');
             
             try {
-                // Викликаємо backend endpoint для перевірки фільтра
                 const response = await fetch(`/api/filters/${filterId}/search`, {
                     method: 'POST'
                 });
