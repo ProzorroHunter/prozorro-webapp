@@ -606,17 +606,25 @@
                 const response = await fetch(`/api/tender/${tenderId}`);
                 const data = await response.json();
                 
+                console.log('Відповідь від API:', data);
+                
+                // Перевіряємо чи є помилка
                 if (data.error) {
-                    showNotification('❌ Тендер не знайдено', 'error');
+                    showNotification('❌ Тендер не знайдено. Перевірте номер.', 'error');
                     return;
                 }
                 
-                window.open(data.url, '_blank');
-                showNotification('✅ Тендер знайдено! Відкрито в новій вкладці');
+                // Якщо тендер знайдено - відкриваємо
+                if (data.url) {
+                    window.open(data.url, '_blank');
+                    showNotification('✅ Тендер знайдено! Відкрито в новій вкладці');
+                } else {
+                    showNotification('❌ Тендер не знайдено', 'error');
+                }
                 
             } catch (e) {
-                showNotification('❌ Помилка пошуку тендера', 'error');
-                console.error(e);
+                showNotification('❌ Помилка пошуку', 'error');
+                console.error('Помилка:', e);
             }
         }
         
