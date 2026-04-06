@@ -65,7 +65,7 @@ PROZORRO_API = "https://public-api.prozorro.gov.ua/api/2.5"
 
 async def search_prozorro_tenders(keywords=None, cpv=None, region=None, min_amount=None, max_amount=None):
     params = {"descending": "1", "limit": "100"}
-    date_from = (datetime.now() - timedelta(days=7)).isoformat()  # Збільшили до 7 днів
+    date_from = (datetime.now() - timedelta(days=7)).isoformat()
     params["offset"] = date_from
     
     try:
@@ -96,7 +96,7 @@ async def search_prozorro_tenders(keywords=None, cpv=None, region=None, min_amou
                     }
                     tenders.append(tender)
                     
-                    if len(tenders) >= 5:  # Максимум 5 тендерів
+                    if len(tenders) >= 5:
                         break
                 except Exception as e:
                     print(f"Помилка тендера {tender_id}: {e}")
@@ -135,6 +135,30 @@ async def root():
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "service": "ProzorroHunter"}
+
+@app.get("/api/tender/{tender_id}")
+async def get_tender_by_id(tender_id: str):
+    """Отримати тендер за номером"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
+            if response.status_code == 404:
+                raise HTTPException(status_code=404, detail="Тендер не знайдено")
+            response.raise_for_status()
+            data = response.json().get("data", {})
+            
+            return {
+                "id": tender_id,
+                "title": data.get("title", ""),
+                "procuringEntity": data.get("procuringEntity", {}).get("name", ""),
+                "amount": data.get("value", {}).get("amount", 0),
+                "status": data.get("status", ""),
+                "url": f"https://prozorro.gov.ua/tender/{tender_id}"
+            }
+    except httpx.HTTPStatusError:
+        raise HTTPException(status_code=404, detail="Тендер не знайдено")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Помилка: {str(e)}")
 
 @app.get("/api/filters")
 async def get_filters():
