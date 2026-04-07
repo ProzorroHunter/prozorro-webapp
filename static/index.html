@@ -44,9 +44,7 @@
         }
 
         .stat-card { padding: 20px; text-align: center; }
-
         .stat-value { font-size: 2rem; font-weight: bold; color: #6366f1; }
-
         .stat-label { font-size: 0.9rem; color: rgba(255,255,255,0.7); margin-top: 5px; }
 
         /* ── Buttons ── */
@@ -63,10 +61,9 @@
 
         .btn:hover { transform: translateY(-2px); box-shadow: 0 10px 30px rgba(99,102,241,0.5); }
 
-        .btn-small { padding: 8px 16px; font-size: 0.875rem; }
-
-        .btn-success { background: linear-gradient(135deg, #10b981, #059669); }
-        .btn-danger  { background: linear-gradient(135deg, #ef4444, #dc2626); }
+        .btn-small    { padding: 8px 16px; font-size: 0.875rem; }
+        .btn-success  { background: linear-gradient(135deg, #10b981, #059669); }
+        .btn-danger   { background: linear-gradient(135deg, #ef4444, #dc2626); }
 
         .btn-secondary {
             background: rgba(255,255,255,0.1);
@@ -253,7 +250,6 @@
         }
 
         th { color: rgba(255,255,255,0.6); font-size: 0.85rem; font-weight: 600; }
-
         tr:hover td { background: rgba(255,255,255,0.04); }
 
         .amount { color: #10b981; font-weight: bold; }
@@ -361,8 +357,8 @@
         /* Loading spinner */
         .spinner {
             display: inline-block;
-            width: 32px; height: 32px;
-            border: 3px solid rgba(99,102,241,0.3);
+            width: 36px; height: 36px;
+            border: 3px solid rgba(99,102,241,0.25);
             border-top-color: #6366f1;
             border-radius: 50%;
             animation: spin 0.8s linear infinite;
@@ -370,21 +366,19 @@
 
         @keyframes spin { to { transform: rotate(360deg); } }
 
-        /* Limited data notice */
+        /* Limited / warning notice */
         .limited-notice {
             background: rgba(245,158,11,0.1);
             border: 1px solid rgba(245,158,11,0.3);
             border-radius: 12px;
-            padding: 20px;
+            padding: 22px 20px;
             text-align: center;
             grid-column: 1 / -1;
         }
 
-        .limited-notice-icon { font-size: 2rem; margin-bottom: 10px; }
-
+        .limited-notice-icon  { font-size: 2rem; margin-bottom: 10px; }
         .limited-notice-title { font-size: 1rem; color: #fbbf24; margin-bottom: 8px; font-weight: 600; }
-
-        .limited-notice-text { font-size: 0.85rem; color: rgba(255,255,255,0.55); line-height: 1.6; }
+        .limited-notice-text  { font-size: 0.85rem; color: rgba(255,255,255,0.55); line-height: 1.6; }
 
         /* Confirm modal */
         .confirm-modal { max-width: 420px; text-align: center; }
@@ -491,27 +485,6 @@
             border-color: rgba(99,102,241,0.5);
             color: white;
         }
-
-        .btn-prozorro-big {
-            display: block;
-            width: 100%;
-            text-align: center;
-            padding: 14px 20px;
-            background: linear-gradient(135deg, #6366f1, #8b5cf6);
-            color: white;
-            border-radius: 10px;
-            font-size: 1rem;
-            font-weight: 600;
-            text-decoration: none;
-            transition: all 0.3s;
-            margin-top: 8px;
-        }
-
-        .btn-prozorro-big:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 30px rgba(99,102,241,0.5);
-            color: white;
-        }
     </style>
 </head>
 <body>
@@ -595,16 +568,10 @@
 <!-- ══ MODAL: Tender detail ══ -->
 <div class="modal" id="tenderModal">
     <div class="modal-content tender-modal-content glass">
-        <div class="tender-modal-id" id="tenderModalId"></div>
+        <div class="tender-modal-id"    id="tenderModalId"></div>
         <div class="tender-modal-title" id="tenderModalTitle"></div>
-        <div class="tender-info-grid" id="tenderInfoGrid"></div>
-        <div class="form-actions" id="tenderModalActions">
-            <button class="btn-secondary" onclick="closeTenderModal()">← Назад</button>
-            <a id="tenderModalLink" href="#" target="_blank"
-               class="btn btn-success" style="text-decoration:none;">
-                🔗 Відкрити на Prozorro
-            </a>
-        </div>
+        <div class="tender-info-grid"   id="tenderInfoGrid"></div>
+        <div class="form-actions"       id="tenderModalActions"></div>
     </div>
 </div>
 
@@ -735,10 +702,10 @@
 
 <script>
 // ─── Global state ──────────────────────────────────────
-let allFilters     = [];
-let allTenders     = [];
-let currentTab     = 'all';
-let deleteFilterId = null;
+let allFilters      = [];
+let allTenders      = [];
+let currentTab      = 'all';
+let deleteFilterId  = null;
 let clearFilterTarget = null;
 
 // ─── Load ──────────────────────────────────────────────
@@ -806,7 +773,7 @@ function renderFilters() {
                 <button class="btn btn-small btn-success" onclick="searchNow(${f.id})">🔍 Шукати зараз</button>
                 ${count > 0
                     ? `<button class="btn btn-small btn-danger"
-                               onclick="askClearFilter(${f.id}, '${escHtml(f.name)}')">
+                               onclick="askClearFilter(${f.id},'${escHtml(f.name)}')">
                                🗑️ Очистити список</button>`
                     : ''}
             </div>
@@ -874,8 +841,6 @@ function renderTendersTable() {
     renderTabs();
 }
 
-// ─── Tab switch ────────────────────────────────────────
-
 function switchTab(tab) {
     currentTab = tab;
     renderFilters();
@@ -885,6 +850,27 @@ function switchTab(tab) {
 
 // ─── Search by tender ID ───────────────────────────────
 
+// Допоміжна функція: показуємо модалку зі спіннером одразу
+function openTenderModalLoading(tenderId) {
+    const url = `https://prozorro.gov.ua/tender/${tenderId}`;
+    document.getElementById('tenderModalId').textContent    = tenderId;
+    document.getElementById('tenderModalTitle').textContent = '⏳ Завантаження...';
+    document.getElementById('tenderInfoGrid').innerHTML     = `
+        <div style="grid-column:1/-1;text-align:center;padding:40px 20px;">
+            <div class="spinner" style="margin:0 auto 16px;"></div>
+            <div style="color:rgba(255,255,255,.5);font-size:.88rem;">
+                Запит до API Prozorro... зазвичай 5–15 секунд
+            </div>
+        </div>`;
+    document.getElementById('tenderModalActions').innerHTML = `
+        <button class="btn-secondary" onclick="closeTenderModal()">← Назад</button>
+        <a href="${escHtml(url)}" target="_blank"
+           class="btn btn-success" style="text-decoration:none;">
+            🔗 Відкрити на Prozorro
+        </a>`;
+    document.getElementById('tenderModal').classList.add('active');
+}
+
 async function searchByTenderId() {
     const tenderId = document.getElementById('tenderIdSearch').value.trim();
     if (!tenderId) {
@@ -892,69 +878,75 @@ async function searchByTenderId() {
         return;
     }
 
-    // Одразу відкриваємо модалку зі спіннером
-    document.getElementById('tenderModalId').textContent    = tenderId;
-    document.getElementById('tenderModalTitle').textContent = '⏳ Завантаження...';
-    document.getElementById('tenderModalLink').href         = `https://prozorro.gov.ua/tender/${tenderId}`;
-    document.getElementById('tenderInfoGrid').innerHTML     = `
-        <div style="grid-column:1/-1;text-align:center;padding:40px;">
-            <div class="spinner" style="margin:0 auto 16px;"></div>
-            <div style="color:rgba(255,255,255,.5);font-size:.9rem;">
-                Запит до API Prozorro... зазвичай 5–15 секунд
-            </div>
-        </div>`;
-
-    // Показуємо тільки кнопку «Назад» поки грузиться
-    document.getElementById('tenderModalActions').innerHTML = `
-        <button class="btn-secondary" onclick="closeTenderModal()">← Назад</button>
-        <a href="https://prozorro.gov.ua/tender/${escHtml(tenderId)}"
-           target="_blank" class="btn btn-success" style="text-decoration:none;">
-            🔗 Відкрити на Prozorro
-        </a>`;
-
-    document.getElementById('tenderModal').classList.add('active');
+    // Модалка відкривається одразу зі спіннером
+    openTenderModalLoading(tenderId);
 
     try {
-        const res  = await fetch(`/api/tender/${encodeURIComponent(tenderId)}`);
-        const data = await res.json();
+        const res = await fetch(`/api/tender/${encodeURIComponent(tenderId)}`);
+
+        // Якщо сервер повернув не-JSON (HTML помилка від Render) — теж обробляємо
+        let data;
+        try {
+            data = await res.json();
+        } catch {
+            // Сервер відповів HTML або щось нечитабельне
+            data = {
+                id: tenderId, limited: true,
+                title: '', procuringEntity: '', amount: 0,
+                currency: 'UAH', status: 'unknown',
+                datePublished: '', region: '', locality: '',
+                cpv: '', cpvDescription: '',
+                url: `https://prozorro.gov.ua/tender/${tenderId}`
+            };
+        }
+
         showTenderModal(data);
+
     } catch(e) {
-        document.getElementById('tenderModalTitle').textContent = '❌ Помилка запиту';
-        document.getElementById('tenderInfoGrid').innerHTML = `
-            <div style="grid-column:1/-1;text-align:center;padding:20px;color:rgba(255,255,255,.5);">
-                Не вдалося отримати відповідь від сервера. Спробуйте ще раз.
-            </div>`;
-        console.error(e);
+        // Мережева помилка (сервер повністю недоступний)
+        console.error('searchByTenderId error:', e);
+        // Замість "Помилка запиту" — показуємо корисну модалку
+        showTenderModal({
+            id: tenderId, limited: true,
+            title: '', procuringEntity: '', amount: 0,
+            currency: 'UAH', status: 'unknown',
+            datePublished: '', region: '', locality: '',
+            cpv: '', cpvDescription: '',
+            url: `https://prozorro.gov.ua/tender/${tenderId}`
+        });
     }
 }
 
 function showTenderModal(data) {
     const modalId    = document.getElementById('tenderModalId');
     const modalTitle = document.getElementById('tenderModalTitle');
-    const modalLink  = document.getElementById('tenderModalLink');
     const grid       = document.getElementById('tenderInfoGrid');
     const actions    = document.getElementById('tenderModalActions');
 
-    modalId.textContent   = data.id || '';
-    modalLink.href        = data.url || '#';
+    modalId.textContent = data.id || '';
+
+    const prozorroBtn = `
+        <a href="${escHtml(data.url)}" target="_blank"
+           class="btn btn-success" style="text-decoration:none;">
+            🔗 Відкрити на Prozorro
+        </a>`;
+
+    const backBtn = `<button class="btn-secondary" onclick="closeTenderModal()">← Назад</button>`;
 
     // ── Якщо API не повернув повні дані ──
     if (data.limited) {
         modalTitle.textContent = 'Дані з API недоступні';
 
-        const hasTitle  = data.title && data.title.trim() !== '';
+        const hasTitle  = data.title && data.title.trim();
         const hasStatus = data.status && data.status !== 'unknown';
-        const hasDate   = data.datePublished && data.datePublished.trim() !== '';
+        const hasDate   = data.datePublished && data.datePublished.trim();
 
         grid.innerHTML = `
             <div class="limited-notice" style="grid-column:1/-1;">
                 <div class="limited-notice-icon">⚠️</div>
-                <div class="limited-notice-title">
-                    Prozorro API не видав деталі для цього тендера
-                </div>
+                <div class="limited-notice-title">Prozorro API не видав деталі для цього тендера</div>
                 <div class="limited-notice-text">
-                    Тендер може бути в стадії планування, скасований, або тимчасово
-                    недоступний через публічний API.<br>
+                    Тендер може бути в стадії планування, скасований або тимчасово недоступний.<br>
                     Посилання на офіційний сайт коректне — перейдіть та перегляньте там.
                 </div>
             </div>
@@ -975,10 +967,12 @@ function showTenderModal(data) {
             </div>` : ''}
         `;
 
+        // Велика кнопка Prozorro для limited режиму
         actions.innerHTML = `
-            <button class="btn-secondary" onclick="closeTenderModal()">← Назад</button>
+            ${backBtn}
             <a href="${escHtml(data.url)}" target="_blank"
-               class="btn btn-success" style="text-decoration:none;flex:1;text-align:center;">
+               class="btn btn-success"
+               style="text-decoration:none;flex:1;text-align:center;">
                 🔗 Відкрити тендер на Prozorro →
             </a>`;
         return;
@@ -1032,12 +1026,7 @@ function showTenderModal(data) {
         </div>` : ''}
     `;
 
-    actions.innerHTML = `
-        <button class="btn-secondary" onclick="closeTenderModal()">← Назад</button>
-        <a href="${escHtml(data.url)}" target="_blank"
-           class="btn btn-success" style="text-decoration:none;">
-            🔗 Відкрити на Prozorro
-        </a>`;
+    actions.innerHTML = `${backBtn}${prozorroBtn}`;
 }
 
 function closeTenderModal() {
@@ -1059,8 +1048,8 @@ async function searchNow(filterId) {
 
 function askDeleteFilter(id, name) {
     deleteFilterId = id;
-    document.getElementById('confirmText').textContent     = `Видалити фільтр «${name}»?`;
-    document.getElementById('deleteTendersCheck').checked  = false;
+    document.getElementById('confirmText').textContent    = `Видалити фільтр «${name}»?`;
+    document.getElementById('deleteTendersCheck').checked = false;
     document.getElementById('confirmModal').classList.add('active');
 }
 
@@ -1096,7 +1085,7 @@ function askClearFilter(filterId, filterName) {
     clearFilterTarget = filterId;
     document.getElementById('clearAllTitle').textContent = '🗑️ Очистити список тендерів?';
     document.getElementById('clearAllText').textContent  =
-        `Буде видалено всі знайдені тендери фільтра «${filterName}». Сам фільтр залишиться.`;
+        `Буде видалено всі тендери фільтра «${filterName}». Сам фільтр залишиться.`;
     document.getElementById('clearAllModal').classList.add('active');
 }
 
@@ -1142,11 +1131,11 @@ document.getElementById('filterForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const filter = {
         name:            document.getElementById('filterName').value,
-        keywords:        document.getElementById('filterKeywords').value    || null,
-        cpv:             document.getElementById('filterCpv').value         || null,
-        region:          document.getElementById('filterRegion').value      || null,
+        keywords:        document.getElementById('filterKeywords').value        || null,
+        cpv:             document.getElementById('filterCpv').value             || null,
+        region:          document.getElementById('filterRegion').value          || null,
         procuringEntity: document.getElementById('filterProcuringEntity').value || null,
-        supplier:        document.getElementById('filterSupplier').value    || null,
+        supplier:        document.getElementById('filterSupplier').value        || null,
         minAmount:       parseFloat(document.getElementById('filterMinAmount').value) || null,
         maxAmount:       parseFloat(document.getElementById('filterMaxAmount').value) || null,
         periodDays:      parseInt(document.getElementById('filterPeriod').value) || 30,
@@ -1206,12 +1195,11 @@ function showNotification(message, type = 'success') {
     setTimeout(() => n.remove(), 3500);
 }
 
-// ─── Close modal on backdrop click ─────────────────────
+// Close modal on backdrop click
 document.querySelectorAll('.modal').forEach(m => {
     m.addEventListener('click', e => { if (e.target === m) m.classList.remove('active'); });
 });
 
-// ─── Auto-refresh ───────────────────────────────────────
 setInterval(loadData, 30000);
 loadData();
 </script>
