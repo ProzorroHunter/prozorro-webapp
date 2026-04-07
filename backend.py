@@ -93,55 +93,104 @@ def make_kw_list(keywords: Optional[str]):
     return [k.strip().lower() for k in keywords.split(",") if k.strip()]
 
 
+# ── Таблиця відповідності: область ↔ місто ───────────────────────────────────
+# Prozorro зберігає тендери міста Харків як region="місто Харків",
+# а тендери Харківської ОБЛАСТІ як region="Харківська область".
+# Ця таблиця дозволяє фільтру "Харківська область" знаходити обидва типи.
+
+OBLAST_ALIASES: dict[str, list[str]] = {
+    "харківська":       ["харків",            "місто харків"],
+    "київська":         ["київ",              "місто київ"],
+    "дніпропетровська": ["дніпро",            "місто дніпро"],
+    "одеська":          ["одеса",             "місто одеса"],
+    "запорізька":       ["запоріжжя",         "місто запоріжжя"],
+    "львівська":        ["львів",             "місто львів"],
+    "донецька":         ["донецьк",           "місто донецьк"],
+    "луганська":        ["луганськ",          "місто луганськ"],
+    "вінницька":        ["вінниця",           "місто вінниця"],
+    "полтавська":       ["полтава",           "місто полтава"],
+    "черкаська":        ["черкаси",           "місто черкаси"],
+    "сумська":          ["суми",              "місто суми"],
+    "миколаївська":     ["миколаїв",          "місто миколаїв"],
+    "херсонська":       ["херсон",            "місто херсон"],
+    "житомирська":      ["житомир",           "місто житомир"],
+    "рівненська":       ["рівне",             "місто рівне"],
+    "кіровоградська":   ["кропивницький",     "кіровоград"],
+    "хмельницька":      ["хмельницький",      "місто хмельницький"],
+    "тернопільська":    ["тернопіль",         "місто тернопіль"],
+    "чернівецька":      ["чернівці",          "місто чернівці"],
+    "чернігівська":     ["чернігів",          "місто чернігів"],
+    "івано-франківська":["івано-франківськ",  "місто івано-франківськ"],
+    "закарпатська":     ["ужгород",           "місто ужгород"],
+    "волинська":        ["луцьк",             "місто луцьк"],
+}
+
+# Зворотня: місто → область (для пошуку по місту — знаходить і область)
+CITY_TO_OBLAST: dict[str, str] = {}
+for oblast_key, cities in OBLAST_ALIASES.items():
+    for city in cities:
+        CITY_TO_OBLAST[city] = oblast_key
+
+
 def region_matches(searched: str, t_region: str, t_locality: str) -> bool:
     """
-    Гнучкий матчинг регіону.
+    Гнучкий матчинг регіону з урахуванням того що Prozorro зберігає:
+      - Тендери великих міст: region="місто Харків"
+      - Тендери решти області: region="Харківська область"
 
-    Prozorro зберігає адреси по-різному:
-      - "Київська область" для тендерів з Київщини
-      - "місто Київ"       для тендерів з міста Київ
-      - "Харківська область", locality="Харків" тощо
-
-    Стратегія (перша що спрацювала → True):
-    1. Пряме входження рядка пошуку в повну адресу
-    2. Перші 6 букв збігаються (відсіває " область" / "місто " суфікси)
-    3. Кожне слово довше 4 букв є в адресі
+    Фільтр "Харківська область" знаходить обидва типи.
+    Фільтр "Харків" (місто) теж знаходить обидва типи.
     """
     s  = searched.lower().strip()
     tr = t_region.lower().strip()
     tl = t_locality.lower().strip()
-    full = f"{tr} {tl}"
+    full_address = f"{tr} {tl}".strip()
 
     # 1. Пряме входження
-    if s in full:
+    if s in full_address:
         return True
 
-    # Нормалізуємо — прибираємо "область", "місто", "м."
-    def norm(r):
-        return (r.replace("область", "").replace("місто", "")
-                 .replace("м.", "").replace("  ", " ").strip())
+    # Нормалізована версія (без "область", "місто", "м.")
+    def norm(r: str) -> str:
+        return (r.replace(" область", "").replace("область", "")
+                  .replace("місто ", "").replace("м. ", "")
+                  .replace("місто", "").strip())
 
-    sn   = norm(s)
-    trn  = norm(tr)
-    tln  = norm(tl)
-    fulln = f"{trn} {tln}"
+    sn       = norm(s)
+    full_n   = norm(full_address)
 
     # 2. Нормалізоване входження
-    if sn and sn in fulln:
+    if sn and sn in full_n:
         return True
-    if trn and trn in sn:
-        return True
-
-    # 3. Перші 6 символів нормалізованого рядка
-    if len(sn) >= 6 and (sn[:6] in fulln):
+    if norm(tr) and norm(tr) in sn:
         return True
 
-    # 4. Кожне смислове слово пошуку є в адресі
-    words = [w for w in sn.split() if len(w) >= 4]
-    if words and all(w in fulln for w in words):
-        return True
+    # 3. Oblast → City aliases (головний виправлений баг)
+    #    "Харківська область" → шукаємо "харків" у повній адресі
+    for oblast_key, city_list in OBLAST_ALIASES.items():
+        if oblast_key in sn:                    # шукаємо по "харківська"
+            for city in city_list:
+                if city in full_address or city in full_n:
+                    return True
+            break
+
+    # 4. City → Oblast (зворотній)
+    #    "Харків" → перевіряємо чи адреса містить "харківська"
+    for city_key, oblast_key in CITY_TO_OBLAST.items():
+        if city_key == sn or sn in city_key:
+            if oblast_key in full_n or oblast_key in norm(tr):
+                return True
 
     return False
+
+
+def get_tender_date(dd: dict) -> str:
+    """Повертає найкращу дату публікації тендера з кількох можливих полів API."""
+    return (dd.get("datePublished")
+            or dd.get("date")
+            or dd.get("tenderPeriod", {}).get("startDate")
+            or dd.get("enquiryPeriod", {}).get("startDate")
+            or "")
 
 
 def save_tender_now(filter_id: int, tender: dict) -> bool:
@@ -191,13 +240,13 @@ async def search_and_save(filter_id: int, keywords=None, cpv=None, region=None,
     total_listed  = 0
     total_details = 0
     total_saved   = 0
-    region_rejects = 0   # лічильник відмов по регіону (для діагностики)
+    region_rejects = 0
     offset = None
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
 
-            for page_num in range(20):   # до 2000 тендерів
+            for page_num in range(20):
 
                 params = {
                     "descending": "1",
@@ -211,7 +260,7 @@ async def search_and_save(filter_id: int, keywords=None, cpv=None, region=None,
                     resp = await client.get(f"{PROZORRO_API}/tenders", params=params)
                     resp.raise_for_status()
                 except Exception as e:
-                    log(f"   ⚠️ Помилка запиту стор.{page_num+1}: {e}")
+                    log(f"   ⚠️ Помилка стор.{page_num+1}: {e}")
                     break
 
                 body       = resp.json()
@@ -267,6 +316,7 @@ async def search_and_save(filter_id: int, keywords=None, cpv=None, region=None,
                     if result["matches"]:
                         items_list = dd.get("items", [])
                         addr       = dd.get("procuringEntity", {}).get("address", {})
+                        date_pub   = get_tender_date(dd)
                         tender = {
                             "id":              tender_id,
                             "title":           dd.get("title", "Без назви"),
@@ -274,27 +324,29 @@ async def search_and_save(filter_id: int, keywords=None, cpv=None, region=None,
                             "amount":          dd.get("value", {}).get("amount", 0),
                             "cpv":             items_list[0].get("classification", {}).get("id", "") if items_list else "",
                             "region":          addr.get("region", ""),
-                            "datePublished":   dd.get("datePublished", ""),
+                            "datePublished":   date_pub,
                             "url":             f"https://prozorro.gov.ua/tender/{tender_id}",
                         }
                         if save_tender_now(filter_id, tender):
                             total_saved += 1
                             log(f"   ✅ #{total_saved} збережено: {tender['title'][:65]}")
+                            log(f"      Регіон={addr.get('region','')} | Дата={date_pub[:10] if date_pub else '?'}")
                         else:
                             log(f"   ⏭ вже є в БД: {tender_id[:20]}...")
 
                         if total_saved >= 10:
                             log(f"   ⏹ Знайдено максимум (10)")
                             break
+
                     else:
-                        # Діагностика регіону — перші 3 відмови по регіону
-                        if region and "Регіон" in result["reason"] and region_rejects < 3:
+                        # Детальне логування регіон-відмов — всі, без ліміту
+                        if region and "Регіон" in result["reason"]:
                             region_rejects += 1
                             addr    = dd.get("procuringEntity", {}).get("address", {})
-                            t_reg   = addr.get("region", "N/A")
-                            t_loc   = addr.get("locality", "N/A")
+                            t_reg   = addr.get("region",   "—")
+                            t_loc   = addr.get("locality", "—")
                             log(f"   🗺 Регіон-відмова #{region_rejects}: "
-                                f"шукали='{region}' | API повернув: region='{t_reg}', locality='{t_loc}'")
+                                f"шукали='{region}' | API: region='{t_reg}', locality='{t_loc}'")
 
                         if total_details <= 5:
                             log(f"   ❌ detail #{total_details}: {dd.get('title','')[:50]}")
@@ -407,7 +459,7 @@ async def get_tender_by_id(tender_id: str):
                     "amount":         data.get("value", {}).get("amount", 0),
                     "currency":       data.get("value", {}).get("currency", "UAH"),
                     "status":         data.get("status", ""),
-                    "datePublished":  data.get("datePublished", ""),
+                    "datePublished":  get_tender_date(data),
                     "region":         data.get("procuringEntity", {}).get("address", {}).get("region", ""),
                     "locality":       data.get("procuringEntity", {}).get("address", {}).get("locality", ""),
                     "cpv":            items[0].get("classification", {}).get("id", "") if items else "",
@@ -422,7 +474,7 @@ async def get_tender_by_id(tender_id: str):
                     t = lst[0]
                     return {**fallback, "limited": True, "newTender": False,
                             "title": t.get("title", ""), "status": t.get("status", "unknown"),
-                            "datePublished": t.get("datePublished", "")}
+                            "datePublished": get_tender_date(t)}
             r3 = await client.get(f"{PROZORRO_API}/tenders",
                                    params={"descending": "1", "limit": "50",
                                            "opt_fields": "id,title,status,dateModified"})
