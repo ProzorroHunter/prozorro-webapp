@@ -1111,12 +1111,18 @@ async function searchNow(filterId) {
 
     const checkResults = async () => {
         try {
-            const res = await fetch(`/api/tenders?filter_id=${filterId}`);
-            const tenders = await res.json();
-            const currentCount = tenders.length;
             const elapsed = Date.now() - startTime;
 
-            if (currentCount > initialCount || elapsed > POLL_TIMEOUT) {
+            // Питаємо бекенд: пошук ще йде?
+            const statusRes = await fetch(`/api/filters/${filterId}/searching`);
+            const { searching } = await statusRes.json();
+
+            if (!searching || elapsed > POLL_TIMEOUT) {
+                // Пошук завершено — отримуємо фінальну кількість
+                const res = await fetch(`/api/tenders?filter_id=${filterId}`);
+                const tenders = await res.json();
+                const currentCount = tenders.length;
+
                 searchingFilters.delete(filterId);
                 if (currentCount === initialCount) {
                     nothingFoundFilters.add(filterId);
