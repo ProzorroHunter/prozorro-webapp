@@ -1107,14 +1107,16 @@ async function searchNow(filterId) {
     } catch(e) {}
 
     const startTime = Date.now();
+    const POLL_TIMEOUT = 8 * 60 * 1000; // 8 хвилин — враховує чергу _search_lock
 
     const checkResults = async () => {
         try {
             const res = await fetch(`/api/tenders?filter_id=${filterId}`);
             const tenders = await res.json();
             const currentCount = tenders.length;
+            const elapsed = Date.now() - startTime;
 
-            if (currentCount > initialCount || Date.now() - startTime > 90000) {
+            if (currentCount > initialCount || elapsed > POLL_TIMEOUT) {
                 searchingFilters.delete(filterId);
                 if (currentCount === initialCount) {
                     nothingFoundFilters.add(filterId);
@@ -1125,7 +1127,7 @@ async function searchNow(filterId) {
                 setTimeout(checkResults, 4000);
             }
         } catch(e) {
-            if (Date.now() - startTime < 90000) {
+            if (Date.now() - startTime < POLL_TIMEOUT) {
                 setTimeout(checkResults, 4000);
             } else {
                 searchingFilters.delete(filterId);
