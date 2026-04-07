@@ -223,89 +223,110 @@ async def health():
 @app.get("/api/tender/{tender_id}")
 async def get_tender_by_id(tender_id: str):
     """Пошук тендера за ID.
-    Таймаут навмисно знижений до 15 сек, щоб вкластися в ліміт Render.com (30 сек на запит).
+    
+    3 спроби:
+    1. Прямий запит /tenders/{id}  → повні дані
+    2. Пошук у списку через ?id=   → часткові дані
+    3. Сканування 50 останніх      → назва + статус (для нових тендерів з затримкою API)
+    
+    Таймаут 15 сек щоб вкластися в ліміт Render.com.
     """
-    print(f"\n🔍 API REQUEST: GET /api/tender/{tender_id}")
-
-    # Завжди формуємо посилання — воно правильне навіть якщо API нічого не дав
+    print(f"\n🔍 ПОШУК ТЕНДЕРА: {tender_id}")
     prozorro_url = f"https://prozorro.gov.ua/tender/{tender_id}"
 
+    # Заготовка відповіді-заглушки (якщо нічого не знайдемо)
+    fallback = {
+        "id": tender_id, "limited": True, "newTender": False,
+        "title": "", "procuringEntity": "", "amount": 0,
+        "currency": "UAH", "status": "unknown",
+        "datePublished": "", "region": "", "locality": "",
+        "cpv": "", "cpvDescription": "", "url": prozorro_url,
+    }
+
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:   # ← 15 сек, не 30
+        async with httpx.AsyncClient(timeout=15.0) as client:
 
-            # СПРОБА 1: Прямий доступ
-            print(f"📡 Спроба 1: {PROZORRO_API}/tenders/{tender_id}")
-            response = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
-            print(f"📊 Статус: {response.status_code}")
+            # ── СПРОБА 1: Прямий доступ ──────────────────────
+            print(f"📡 Спроба 1: прямий запит...")
+            resp1 = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
+            print(f"   Статус: {resp1.status_code}")
 
-            if response.status_code == 200:
-                data  = response.json().get("data", {})
+            if resp1.status_code == 200:
+                data  = resp1.json().get("data", {})
                 items = data.get("items", [])
-                print(f"✅ Знайдено прямим запитом\n")
+                print(f"✅ Знайдено (спроба 1)\n")
                 return {
-                    "id":               tender_id,
-                    "limited":          False,
-                    "title":            data.get("title", ""),
-                    "procuringEntity":  data.get("procuringEntity", {}).get("name", ""),
-                    "amount":           data.get("value", {}).get("amount", 0),
-                    "currency":         data.get("value", {}).get("currency", "UAH"),
-                    "status":           data.get("status", ""),
-                    "datePublished":    data.get("datePublished", ""),
-                    "region":           data.get("procuringEntity", {}).get("address", {}).get("region", ""),
-                    "locality":         data.get("procuringEntity", {}).get("address", {}).get("locality", ""),
-                    "cpv":              items[0].get("classification", {}).get("id", "") if items else "",
-                    "cpvDescription":   items[0].get("classification", {}).get("description", "") if items else "",
-                    "url":              prozorro_url,
+                    "id":             tender_id,
+                    "limited":        False,
+                    "newTender":      False,
+                    "title":          data.get("title", ""),
+                    "procuringEntity":data.get("procuringEntity", {}).get("name", ""),
+                    "amount":         data.get("value", {}).get("amount", 0),
+                    "currency":       data.get("value", {}).get("currency", "UAH"),
+                    "status":         data.get("status", ""),
+                    "datePublished":  data.get("datePublished", ""),
+                    "region":         data.get("procuringEntity", {}).get("address", {}).get("region", ""),
+                    "locality":       data.get("procuringEntity", {}).get("address", {}).get("locality", ""),
+                    "cpv":            items[0].get("classification", {}).get("id", "") if items else "",
+                    "cpvDescription": items[0].get("classification", {}).get("description", "") if items else "",
+                    "url":            prozorro_url,
                 }
 
-            # СПРОБА 2: Пошук через список
-            print(f"⚠️ Статус {response.status_code}, пробую пошук...")
-            search_resp = await client.get(
+            # ── СПРОБА 2: Пошук через параметр id= ───────────
+            print(f"⚠️ Спроба 2: пошук через ?id=...")
+            resp2 = await client.get(
                 f"{PROZORRO_API}/tenders",
                 params={"id": tender_id, "limit": 1}
             )
-
-            if search_resp.status_code == 200:
-                items_list = search_resp.json().get("data", [])
-                if items_list:
-                    t = items_list[0]
-                    print(f"✅ Знайдено через пошук\n")
+            if resp2.status_code == 200:
+                items2 = resp2.json().get("data", [])
+                if items2:
+                    t = items2[0]
+                    print(f"✅ Знайдено (спроба 2)\n")
                     return {
-                        "id":               tender_id,
-                        "limited":          True,
-                        "title":            t.get("title", ""),
-                        "procuringEntity":  "",
-                        "amount":           0,
-                        "currency":         "UAH",
-                        "status":           t.get("status", "unknown"),
-                        "datePublished":    t.get("datePublished", ""),
-                        "region":           "",
-                        "locality":         "",
-                        "cpv":              "",
-                        "cpvDescription":   "",
-                        "url":              prozorro_url,
+                        "id": tender_id, "limited": True, "newTender": False,
+                        "title": t.get("title", ""),
+                        "procuringEntity": "",
+                        "amount": 0, "currency": "UAH",
+                        "status": t.get("status", "unknown"),
+                        "datePublished": t.get("datePublished", ""),
+                        "region": "", "locality": "", "cpv": "", "cpvDescription": "",
+                        "url": prozorro_url,
                     }
 
-            # СПРОБА 3: Просто посилання
-            print(f"⚠️ API не знайшов даних — повертаємо посилання\n")
-            return {
-                "id": tender_id, "limited": True,
-                "title": "", "procuringEntity": "", "amount": 0,
-                "currency": "UAH", "status": "unknown",
-                "datePublished": "", "region": "", "locality": "",
-                "cpv": "", "cpvDescription": "", "url": prozorro_url,
-            }
+            # ── СПРОБА 3: Сканування 50 останніх тендерів ────
+            # Деякі нові тендери є в загальному списку, але недоступні напряму.
+            # Відбувається через затримку індексації API Prozorro (може бути кілька годин).
+            print(f"⚠️ Спроба 3: сканування останніх 50 тендерів...")
+            resp3 = await client.get(
+                f"{PROZORRO_API}/tenders",
+                params={"descending": "1", "limit": "50"}
+            )
+            if resp3.status_code == 200:
+                recent = resp3.json().get("data", [])
+                for t in recent:
+                    if t.get("id") == tender_id:
+                        print(f"✅ Знайдено в списку останніх (спроба 3)\n")
+                        return {
+                            "id": tender_id, "limited": True, "newTender": False,
+                            "title": t.get("title", ""),
+                            "procuringEntity": "",
+                            "amount": 0, "currency": "UAH",
+                            "status": t.get("status", "unknown"),
+                            "datePublished": t.get("datePublished", ""),
+                            "region": "", "locality": "", "cpv": "", "cpvDescription": "",
+                            "url": prozorro_url,
+                        }
+                print(f"⚠️ Тендер не знайдено у жодній з трьох спроб.")
+                print(f"   Скоріш за все, новий тендер ще не проіндексовано API (затримка кілька годин)\n")
+
+            # Нічого не знайшли — позначаємо як "новий" тендер з затримкою
+            fallback["newTender"] = True
+            return fallback
 
     except Exception as e:
-        # Навіть при будь-якій помилці — повертаємо валідний JSON з посиланням
-        print(f"❌ EXCEPTION в get_tender_by_id: {type(e).__name__}: {e}\n")
-        return {
-            "id": tender_id, "limited": True,
-            "title": "", "procuringEntity": "", "amount": 0,
-            "currency": "UAH", "status": "unknown",
-            "datePublished": "", "region": "", "locality": "",
-            "cpv": "", "cpvDescription": "", "url": prozorro_url,
-        }
+        print(f"❌ EXCEPTION: {type(e).__name__}: {e}\n")
+        return fallback
 
 
 @app.get("/api/filters")
