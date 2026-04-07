@@ -20,18 +20,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 🔮 Зарезервовано для майбутньої функції відстеження тендерів через Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 def init_db():
-    """Ініціалізація БД БЕЗ видалення даних"""
     conn = sqlite3.connect('prozorro.db')
     c = conn.cursor()
-
     c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filters'")
-    filters_exists = c.fetchone()
-
-    if not filters_exists:
+    if not c.fetchone():
         c.execute('''CREATE TABLE filters (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -47,7 +42,6 @@ def init_db():
             found_count INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
-
         c.execute('''CREATE TABLE tenders (
             id TEXT PRIMARY KEY,
             title TEXT,
@@ -61,11 +55,9 @@ def init_db():
             notified BOOLEAN DEFAULT 0,
             FOREIGN KEY (filter_id) REFERENCES filters(id)
         )''')
-
         print("✅ Таблиці створено")
     else:
         print("✅ Таблиці існують")
-
     conn.commit()
     conn.close()
 
@@ -85,108 +77,208 @@ class FilterCreate(BaseModel):
 PROZORRO_API = "https://public-api.prozorro.gov.ua/api/2.5"
 
 
+def make_kw_list(keywords: Optional[str]):
+    if not keywords:
+        return []
+    return [k.strip().lower() for k in keywords.split(",") if k.strip()]
+
+
+def normalize_region(r: str) -> str:
+    return (r.lower()
+             .replace("місто ", "").replace("м. ", "")
+             .replace(" область", "").replace("область", "")
+             .strip())
+
+
 async def search_prozorro_tenders(keywords=None, cpv=None, region=None, procuring_entity=None,
                                   supplier=None, min_amount=None, max_amount=None, period_days=30):
-    params = {"descending": "1", "limit": "100"}
+    """
+    ПРАВИЛЬНий алгоритм пошуку:
+
+    ПОМИЛКА старого коду: offset=дата_90_днів_тому при descending=1 відправляв пошук
+    в МИНУЛЕ (старіше 90 днів), а не в останні 90 днів.
+
+    Як насправді працює Prozorro API:
+      - descending=1 → від нових до старих
+      - offset → курсор пагінації (dateModified останнього елемента попередньої сторінки)
+      - Перша сторінка БЕЗ offset → найсвіжіші тендери
+      - Наступні сторінки через next_page.offset → йдемо в минуле
+      - Зупиняємось коли тендери виходять за межі нашого periodDays
+
+    Додатково:
+      - opt_fields=title запитуємо заголовок у списку → пропускаємо detail-запит
+        для тендерів де title не містить ключових слів (швидкість × 10-20)
+      - Гнучкий матчинг регіону: "Київ" == "місто Київ" == "м. Київ"
+    """
     date_from = (datetime.now() - timedelta(days=period_days)).isoformat()
-    params["offset"] = date_from
+    kw_list   = make_kw_list(keywords)
 
     print(f"\n🔍 ПОШУК ТЕНДЕРІВ:")
-    print(f"   Keywords: {keywords}")
-    print(f"   Region: {region}")
-    print(f"   Procuring: {procuring_entity}")
-    print(f"   Supplier: {supplier}")
-    print(f"   Period: {period_days} днів")
+    print(f"   Keywords : {keywords}")
+    print(f"   Region   : {region}")
+    print(f"   CPV      : {cpv}")
+    print(f"   Period   : {period_days} днів (від {date_from[:10]})")
+
+    tenders       = []
+    total_listed  = 0
+    total_details = 0
+    offset        = None   # ← ПЕРША СТОРІНКА БЕЗ OFFSET (найсвіжіші)
+    stop_reason   = ""
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(f"{PROZORRO_API}/tenders", params=params)
-            response.raise_for_status()
-            data = response.json()
 
-            total = len(data.get('data', []))
-            print(f"📊 Отримано {total} тендерів з API")
+            for page_num in range(15):  # до 1500 тендерів
 
-            tenders = []
-            checked = 0
+                # Будуємо запит
+                params = {
+                    "descending": "1",
+                    "limit":      "100",
+                    "opt_fields": "id,title,status,dateModified",
+                }
+                if offset:
+                    params["offset"] = offset
+                # Перша ітерація — без offset, решта — з курсором
 
-            for tender_data in data.get("data", [])[:100]:
-                tender_id = tender_data.get("id")
-                checked += 1
+                resp = await client.get(f"{PROZORRO_API}/tenders", params=params)
+                resp.raise_for_status()
+                body       = resp.json()
+                page_items = body.get("data", [])
 
-                try:
-                    detail_response = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
-                    detail_data = detail_response.json().get("data", {})
+                if not page_items:
+                    stop_reason = "порожня сторінка"
+                    break
 
-                    result = check_filter_detailed(detail_data, keywords, cpv, region,
-                                                   procuring_entity, supplier, min_amount, max_amount)
+                total_listed += len(page_items)
+                next_offset   = body.get("next_page", {}).get("offset")
 
-                    if result["matches"]:
-                        items = detail_data.get("items", [])
-                        tender = {
-                            "id": tender_id,
-                            "title": detail_data.get("title", "Без назви"),
-                            "procuringEntity": detail_data.get("procuringEntity", {}).get("name", "Невідомо"),
-                            "amount": detail_data.get("value", {}).get("amount", 0),
-                            "cpv": items[0].get("classification", {}).get("id", "") if items else "",
-                            "region": detail_data.get("procuringEntity", {}).get("address", {}).get("region", ""),
-                            "datePublished": detail_data.get("datePublished", ""),
-                            "url": f"https://prozorro.gov.ua/tender/{tender_id}"
-                        }
-                        tenders.append(tender)
-                        print(f"✅ Знайдено #{len(tenders)}: {tender['title'][:60]}")
-                    else:
-                        if len(tenders) == 0 and checked <= 3:
-                            title = detail_data.get("title", "")[:60]
-                            print(f"❌ {checked}. НЕ ПІДХОДИТЬ: {title}")
-                            print(f"   Причина: {result['reason']}")
+                print(f"   📄 Стор.{page_num+1}: {len(page_items)} тендерів "
+                      f"(переглянуто {total_listed})")
 
-                    if len(tenders) >= 10:
+                reached_boundary = False
+
+                for item in page_items:
+                    tender_id  = item.get("id", "")
+                    item_date  = item.get("dateModified", "")
+                    list_title = item.get("title", "")
+
+                    # ── Перевірка межі часового вікна ──────────────────────
+                    # Якщо поточний тендер старіший за наш period — стоп.
+                    if item_date and item_date < date_from:
+                        reached_boundary = True
+                        print(f"   ⏹  Досягнуто межі {period_days} днів "
+                              f"(тендер {item_date[:10]} < {date_from[:10]})")
                         break
 
-                except Exception as e:
-                    if checked <= 3:
-                        print(f"⚠️ Помилка тендера {tender_id}: {e}")
-                    continue
+                    # ── Швидкий pre-filter по заголовку ────────────────────
+                    # list_title повертається якщо opt_fields спрацював.
+                    # Якщо заголовок є і keywords є — перевіряємо БЕЗ detail-запиту.
+                    if list_title and kw_list:
+                        if not any(kw in list_title.lower() for kw in kw_list):
+                            continue  # пропускаємо — не витрачаємо detail-запит
 
-            print(f"📈 Результат: {len(tenders)} тендерів з {checked} перевірених\n")
-            return tenders
+                    # ── Detail-запит ────────────────────────────────────────
+                    total_details += 1
+                    try:
+                        dr = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
+                        if dr.status_code != 200:
+                            continue
+                        dd = dr.json().get("data", {})
+                    except Exception:
+                        continue
+
+                    # Перевірка дати у detail (якщо opt_fields не повернув dateModified)
+                    detail_date = dd.get("dateModified", dd.get("datePublished", ""))
+                    if detail_date and detail_date < date_from:
+                        reached_boundary = True
+                        break
+
+                    result = check_filter_detailed(
+                        dd, keywords, cpv, region,
+                        procuring_entity, supplier, min_amount, max_amount
+                    )
+
+                    if result["matches"]:
+                        items_list = dd.get("items", [])
+                        tenders.append({
+                            "id":              tender_id,
+                            "title":           dd.get("title", "Без назви"),
+                            "procuringEntity": dd.get("procuringEntity", {}).get("name", "Невідомо"),
+                            "amount":          dd.get("value", {}).get("amount", 0),
+                            "cpv":             items_list[0].get("classification", {}).get("id", "") if items_list else "",
+                            "region":          dd.get("procuringEntity", {}).get("address", {}).get("region", ""),
+                            "datePublished":   dd.get("datePublished", ""),
+                            "url":             f"https://prozorro.gov.ua/tender/{tender_id}",
+                        })
+                        print(f"   ✅ #{len(tenders)}: {tenders[-1]['title'][:70]}")
+                        if len(tenders) >= 10:
+                            stop_reason = "знайдено 10 тендерів"
+                            break
+                    else:
+                        if total_details <= 5:
+                            print(f"   ❌ detail #{total_details}: "
+                                  f"{dd.get('title','')[:55]}")
+                            print(f"      → {result['reason']}")
+
+                if len(tenders) >= 10 or reached_boundary:
+                    break
+
+                if not next_offset:
+                    stop_reason = "немає наступної сторінки"
+                    break
+
+                offset = next_offset   # → наступна сторінка (йдемо в минуле)
 
     except Exception as e:
         print(f"❌ КРИТИЧНА ПОМИЛКА: {e}")
         print(traceback.format_exc())
-        return []
+
+    print(f"   📊 У списках: {total_listed}  |  Detail-запитів: {total_details}"
+          f"  |  Стоп: {stop_reason or 'кінець вікна'}")
+    print(f"   📈 Результат: {len(tenders)} тендерів\n")
+    return tenders
 
 
-def check_filter_detailed(tender, keywords, cpv, region, procuring_entity, supplier, min_amount, max_amount):
+def check_filter_detailed(tender, keywords, cpv, region, procuring_entity,
+                           supplier, min_amount, max_amount):
+    # ── Keywords ──
     if keywords:
-        title = tender.get("title", "").lower()
-        description = tender.get("description", "").lower()
-        text = title + " " + description
-        kw_list = [k.strip().lower() for k in keywords.split(",")]
-        found = [kw for kw in kw_list if kw in text]
-        if not found:
-            return {"matches": False, "reason": f"Немає жодного з ключових слів '{keywords}' в тексті"}
+        text    = (tender.get("title", "") + " " + tender.get("description", "")).lower()
+        kw_list = make_kw_list(keywords)
+        if not any(kw in text for kw in kw_list):
+            return {"matches": False,
+                    "reason": f"Немає жодного з ключових слів '{keywords}' в тексті"}
 
+    # ── CPV ──
     if cpv:
         items = tender.get("items", [])
         if items:
             tender_cpv = items[0].get("classification", {}).get("id", "")
             if not tender_cpv.startswith(cpv[:3]):
-                return {"matches": False, "reason": f"CPV не співпадає: потрібен {cpv[:3]}*, є {tender_cpv}"}
+                return {"matches": False,
+                        "reason": f"CPV: потрібен {cpv[:3]}*, є {tender_cpv}"}
 
+    # ── Region — гнучкий матчинг ──
     if region:
-        tender_region = tender.get("procuringEntity", {}).get("address", {}).get("region", "")
-        tender_locality = tender.get("procuringEntity", {}).get("address", {}).get("locality", "")
-        location = (tender_region + " " + tender_locality).lower()
-        if region.lower() not in location:
-            return {"matches": False, "reason": f"Регіон не співпадає: шукаємо '{region}', знайдено '{tender_region} {tender_locality}'"}
+        addr     = tender.get("procuringEntity", {}).get("address", {})
+        t_region = addr.get("region",   "")
+        t_local  = addr.get("locality", "")
+        full_loc = (t_region + " " + t_local).lower()
+        r_lower  = region.lower()
+        r_norm   = normalize_region(region)
+        loc_norm = normalize_region(t_region) + " " + normalize_region(t_local)
 
+        if r_lower not in full_loc and r_norm not in loc_norm:
+            return {"matches": False,
+                    "reason": f"Регіон: шукаємо '{region}', є '{t_region} {t_local}'"}
+
+    # ── Procuring entity ──
     if procuring_entity:
         entity = tender.get("procuringEntity", {}).get("name", "").lower()
         if procuring_entity.lower() not in entity:
             return {"matches": False, "reason": "Замовник не співпадає"}
 
+    # ── Supplier ──
     if supplier:
         found = False
         for award in tender.get("awards", []):
@@ -198,18 +290,19 @@ def check_filter_detailed(tender, keywords, cpv, region, procuring_entity, suppl
         if not found:
             return {"matches": False, "reason": "Виконавець не співпадає"}
 
+    # ── Amount ──
     amount = tender.get("value", {}).get("amount", 0)
     if min_amount and amount < min_amount:
-        return {"matches": False, "reason": f"Сума {amount} менша ніж мінімум {min_amount}"}
+        return {"matches": False, "reason": f"Сума {amount} < мін. {min_amount}"}
     if max_amount and amount > max_amount:
-        return {"matches": False, "reason": f"Сума {amount} більша ніж максимум {max_amount}"}
+        return {"matches": False, "reason": f"Сума {amount} > макс. {max_amount}"}
 
     return {"matches": True, "reason": "OK"}
 
 
-# ──────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════
 #  ROUTES
-# ──────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════
 
 @app.get("/")
 async def root():
@@ -222,19 +315,8 @@ async def health():
 
 @app.get("/api/tender/{tender_id}")
 async def get_tender_by_id(tender_id: str):
-    """Пошук тендера за ID.
-    
-    3 спроби:
-    1. Прямий запит /tenders/{id}  → повні дані
-    2. Пошук у списку через ?id=   → часткові дані
-    3. Сканування 50 останніх      → назва + статус (для нових тендерів з затримкою API)
-    
-    Таймаут 15 сек щоб вкластися в ліміт Render.com.
-    """
     print(f"\n🔍 ПОШУК ТЕНДЕРА: {tender_id}")
     prozorro_url = f"https://prozorro.gov.ua/tender/{tender_id}"
-
-    # Заготовка відповіді-заглушки (якщо нічого не знайдемо)
     fallback = {
         "id": tender_id, "limited": True, "newTender": False,
         "title": "", "procuringEntity": "", "amount": 0,
@@ -242,23 +324,15 @@ async def get_tender_by_id(tender_id: str):
         "datePublished": "", "region": "", "locality": "",
         "cpv": "", "cpvDescription": "", "url": prozorro_url,
     }
-
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-
-            # ── СПРОБА 1: Прямий доступ ──────────────────────
-            print(f"📡 Спроба 1: прямий запит...")
-            resp1 = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
-            print(f"   Статус: {resp1.status_code}")
-
-            if resp1.status_code == 200:
-                data  = resp1.json().get("data", {})
+            r1 = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
+            print(f"   Спроба 1 → {r1.status_code}")
+            if r1.status_code == 200:
+                data  = r1.json().get("data", {})
                 items = data.get("items", [])
-                print(f"✅ Знайдено (спроба 1)\n")
                 return {
-                    "id":             tender_id,
-                    "limited":        False,
-                    "newTender":      False,
+                    "id": tender_id, "limited": False, "newTender": False,
                     "title":          data.get("title", ""),
                     "procuringEntity":data.get("procuringEntity", {}).get("name", ""),
                     "amount":         data.get("value", {}).get("amount", 0),
@@ -271,61 +345,27 @@ async def get_tender_by_id(tender_id: str):
                     "cpvDescription": items[0].get("classification", {}).get("description", "") if items else "",
                     "url":            prozorro_url,
                 }
-
-            # ── СПРОБА 2: Пошук через параметр id= ───────────
-            print(f"⚠️ Спроба 2: пошук через ?id=...")
-            resp2 = await client.get(
-                f"{PROZORRO_API}/tenders",
-                params={"id": tender_id, "limit": 1}
-            )
-            if resp2.status_code == 200:
-                items2 = resp2.json().get("data", [])
-                if items2:
-                    t = items2[0]
-                    print(f"✅ Знайдено (спроба 2)\n")
-                    return {
-                        "id": tender_id, "limited": True, "newTender": False,
-                        "title": t.get("title", ""),
-                        "procuringEntity": "",
-                        "amount": 0, "currency": "UAH",
-                        "status": t.get("status", "unknown"),
-                        "datePublished": t.get("datePublished", ""),
-                        "region": "", "locality": "", "cpv": "", "cpvDescription": "",
-                        "url": prozorro_url,
-                    }
-
-            # ── СПРОБА 3: Сканування 50 останніх тендерів ────
-            # Деякі нові тендери є в загальному списку, але недоступні напряму.
-            # Відбувається через затримку індексації API Prozorro (може бути кілька годин).
-            print(f"⚠️ Спроба 3: сканування останніх 50 тендерів...")
-            resp3 = await client.get(
-                f"{PROZORRO_API}/tenders",
-                params={"descending": "1", "limit": "50"}
-            )
-            if resp3.status_code == 200:
-                recent = resp3.json().get("data", [])
-                for t in recent:
+            r2 = await client.get(f"{PROZORRO_API}/tenders",
+                                   params={"id": tender_id, "limit": 1})
+            if r2.status_code == 200:
+                lst = r2.json().get("data", [])
+                if lst:
+                    t = lst[0]
+                    return {**fallback, "limited": True, "newTender": False,
+                            "title": t.get("title", ""), "status": t.get("status", "unknown"),
+                            "datePublished": t.get("datePublished", "")}
+            r3 = await client.get(f"{PROZORRO_API}/tenders",
+                                   params={"descending": "1", "limit": "50",
+                                           "opt_fields": "id,title,status,dateModified"})
+            if r3.status_code == 200:
+                for t in r3.json().get("data", []):
                     if t.get("id") == tender_id:
-                        print(f"✅ Знайдено в списку останніх (спроба 3)\n")
-                        return {
-                            "id": tender_id, "limited": True, "newTender": False,
-                            "title": t.get("title", ""),
-                            "procuringEntity": "",
-                            "amount": 0, "currency": "UAH",
-                            "status": t.get("status", "unknown"),
-                            "datePublished": t.get("datePublished", ""),
-                            "region": "", "locality": "", "cpv": "", "cpvDescription": "",
-                            "url": prozorro_url,
-                        }
-                print(f"⚠️ Тендер не знайдено у жодній з трьох спроб.")
-                print(f"   Скоріш за все, новий тендер ще не проіндексовано API (затримка кілька годин)\n")
-
-            # Нічого не знайшли — позначаємо як "новий" тендер з затримкою
+                        return {**fallback, "limited": True, "newTender": False,
+                                "title": t.get("title", ""), "status": t.get("status", "unknown")}
             fallback["newTender"] = True
             return fallback
-
     except Exception as e:
-        print(f"❌ EXCEPTION: {type(e).__name__}: {e}\n")
+        print(f"❌ EXCEPTION: {type(e).__name__}: {e}")
         return fallback
 
 
@@ -338,15 +378,11 @@ async def get_filters():
                  FROM filters WHERE is_active = 1 ORDER BY id''')
     rows = c.fetchall()
     conn.close()
-    return [
-        {
-            "id": row[0], "name": row[1], "keywords": row[2], "cpv": row[3],
-            "region": row[4], "procuringEntity": row[5], "supplier": row[6],
-            "minAmount": row[7], "maxAmount": row[8], "periodDays": row[9],
-            "isActive": bool(row[10]), "foundCount": row[11]
-        }
-        for row in rows
-    ]
+    return [{"id": r[0], "name": r[1], "keywords": r[2], "cpv": r[3],
+             "region": r[4], "procuringEntity": r[5], "supplier": r[6],
+             "minAmount": r[7], "maxAmount": r[8], "periodDays": r[9],
+             "isActive": bool(r[10]), "foundCount": r[11]}
+            for r in rows]
 
 
 @app.post("/api/filters")
@@ -383,7 +419,6 @@ async def delete_filter(filter_id: int):
     c.execute('UPDATE filters SET is_active = 0 WHERE id = ?', (filter_id,))
     conn.commit()
     conn.close()
-    print(f"\n🗑️ Видалено фільтр #{filter_id}\n")
     return {"message": "Фільтр видалено"}
 
 
@@ -397,27 +432,21 @@ async def get_tenders(limit: int = 200, filter_id: Optional[int] = None):
                       t.date_published, t.url, t.filter_id, f.name
                FROM tenders t LEFT JOIN filters f ON t.filter_id = f.id
                WHERE t.filter_id = ? ORDER BY t.date_published DESC LIMIT ?''',
-            (filter_id, limit)
-        )
+            (filter_id, limit))
     else:
         c.execute(
             '''SELECT t.id, t.title, t.procuring_entity, t.amount, t.cpv, t.region,
                       t.date_published, t.url, t.filter_id, f.name
                FROM tenders t LEFT JOIN filters f ON t.filter_id = f.id
                ORDER BY t.date_published DESC LIMIT ?''',
-            (limit,)
-        )
+            (limit,))
     rows = c.fetchall()
     conn.close()
-    return [
-        {
-            "id": row[0], "title": row[1], "procuringEntity": row[2],
-            "amount": row[3], "cpv": row[4], "region": row[5],
-            "datePublished": row[6], "url": row[7],
-            "filterId": row[8], "filterName": row[9]
-        }
-        for row in rows
-    ]
+    return [{"id": r[0], "title": r[1], "procuringEntity": r[2],
+             "amount": r[3], "cpv": r[4], "region": r[5],
+             "datePublished": r[6], "url": r[7],
+             "filterId": r[8], "filterName": r[9]}
+            for r in rows]
 
 
 @app.delete("/api/tenders/all")
@@ -428,7 +457,6 @@ async def clear_all_tenders():
     c.execute('UPDATE filters SET found_count = 0')
     conn.commit()
     conn.close()
-    print(f"\n🗑️ Всі тендери очищено\n")
     return {"message": "Всі тендери очищено"}
 
 
@@ -440,7 +468,6 @@ async def clear_filter_tenders(filter_id: int):
     c.execute('UPDATE filters SET found_count = 0 WHERE id = ?', (filter_id,))
     conn.commit()
     conn.close()
-    print(f"\n🗑️ Тендери фільтра #{filter_id} очищено\n")
     return {"message": f"Тендери фільтра #{filter_id} очищено"}
 
 
@@ -465,9 +492,7 @@ async def check_filter_task(filter_id: int):
     c.execute(
         '''SELECT keywords, cpv, region, procuring_entity, supplier,
                   min_amount, max_amount, period_days
-           FROM filters WHERE id = ?''',
-        (filter_id,)
-    )
+           FROM filters WHERE id = ?''', (filter_id,))
     fd = c.fetchone()
     if not fd:
         conn.close()
