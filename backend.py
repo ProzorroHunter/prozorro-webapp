@@ -434,8 +434,30 @@ async def health():
     return {"status": "ok"}
 
 
+def _build_tender_response(tender_id: str, data: dict, prozorro_url: str, limited: bool = False) -> dict:
+    items = data.get("items", [])
+    addr  = data.get("procuringEntity", {}).get("address", {})
+    return {
+        "id":              tender_id,
+        "limited":         limited,
+        "newTender":       False,
+        "title":           data.get("title", ""),
+        "procuringEntity": data.get("procuringEntity", {}).get("name", ""),
+        "amount":          data.get("value", {}).get("amount", 0),
+        "currency":        data.get("value", {}).get("currency", "UAH"),
+        "status":          data.get("status", ""),
+        "datePublished":   get_tender_date(data),
+        "region":          addr.get("region", ""),
+        "locality":        addr.get("locality", ""),
+        "cpv":             items[0].get("classification", {}).get("id", "") if items else "",
+        "cpvDescription":  items[0].get("classification", {}).get("description", "") if items else "",
+        "url":             prozorro_url,
+    }
+
+
 @app.get("/api/tender/{tender_id}")
 async def get_tender_by_id(tender_id: str):
+    import re
     log(f"\n🔍 ПОШУК ТЕНДЕРА: {tender_id}")
     prozorro_url = f"https://prozorro.gov.ua/tender/{tender_id}"
     fallback = {
@@ -445,45 +467,68 @@ async def get_tender_by_id(tender_id: str):
         "datePublished": "", "region": "", "locality": "",
         "cpv": "", "cpvDescription": "", "url": prozorro_url,
     }
+    is_ua_id = bool(re.match(r'^UA-\d{4}-\d{2}-\d{2}-', tender_id))
+
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            r1 = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
-            log(f"   Спроба 1 → {r1.status_code}")
-            if r1.status_code == 200:
-                data  = r1.json().get("data", {})
-                items = data.get("items", [])
-                return {
-                    "id": tender_id, "limited": False, "newTender": False,
-                    "title":          data.get("title", ""),
-                    "procuringEntity":data.get("procuringEntity", {}).get("name", ""),
-                    "amount":         data.get("value", {}).get("amount", 0),
-                    "currency":       data.get("value", {}).get("currency", "UAH"),
-                    "status":         data.get("status", ""),
-                    "datePublished":  get_tender_date(data),
-                    "region":         data.get("procuringEntity", {}).get("address", {}).get("region", ""),
-                    "locality":       data.get("procuringEntity", {}).get("address", {}).get("locality", ""),
-                    "cpv":            items[0].get("classification", {}).get("id", "") if items else "",
-                    "cpvDescription": items[0].get("classification", {}).get("description", "") if items else "",
-                    "url":            prozorro_url,
+
+            # Спроба 1: прямий запит (працює тільки для внутрішніх hex-ID)
+            if not is_ua_id:
+                r1 = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
+                log(f"   Спроба 1 (hex) → {r1.status_code}")
+                if r1.status_code == 200:
+                    data = r1.json().get("data", {})
+                    return _build_tender_response(tender_id, data, prozorro_url)
+
+            # Спроба 2: пошук по tenderID в списку (UA-YYYY-MM-DD-...)
+            # Сканується до 10 сторінок по 100 тендерів
+            log(f"   Шукаю по tenderID у списку...")
+            offset = None
+            for page in range(10):
+                params = {
+                    "opt_fields": "id,tenderID,title,status,dateModified",
+                    "descending": "1",
+                    "limit":      "100",
                 }
-            r2 = await client.get(f"{PROZORRO_API}/tenders",
-                                   params={"id": tender_id, "limit": 1})
-            if r2.status_code == 200:
-                lst = r2.json().get("data", [])
-                if lst:
-                    t = lst[0]
-                    return {**fallback, "limited": True, "newTender": False,
-                            "title": t.get("title", ""), "status": t.get("status", "unknown"),
-                            "datePublished": get_tender_date(t)}
-            r3 = await client.get(f"{PROZORRO_API}/tenders",
-                                   params={"descending": "1", "limit": "50",
-                                           "opt_fields": "id,title,status,dateModified"})
-            if r3.status_code == 200:
-                for t in r3.json().get("data", []):
-                    if t.get("id") == tender_id:
-                        return {**fallback, "limited": True, "newTender": False,
-                                "title": t.get("title", ""), "status": t.get("status", "unknown")}
+                if offset:
+                    params["offset"] = offset
+
+                r = await client.get(f"{PROZORRO_API}/tenders", params=params)
+                if r.status_code != 200:
+                    break
+
+                body  = r.json()
+                items = body.get("data", [])
+                log(f"   Стор.{page+1}: {len(items)} тендерів")
+
+                for item in items:
+                    if item.get("tenderID") == tender_id or item.get("id") == tender_id:
+                        internal_id = item["id"]
+                        log(f"   ✅ Знайдено! internal_id={internal_id}")
+                        rd = await client.get(f"{PROZORRO_API}/tenders/{internal_id}")
+                        if rd.status_code == 200:
+                            data = rd.json().get("data", {})
+                            return _build_tender_response(tender_id, data, prozorro_url)
+                        # detail недоступний — повертаємо часткові дані зі списку
+                        return {**fallback, "limited": True,
+                                "title":         item.get("title", ""),
+                                "status":        item.get("status", "unknown"),
+                                "datePublished": get_tender_date(item)}
+
+                # Зупиняємось якщо дата тендерів стала старша за 90 днів
+                if items:
+                    last_date = items[-1].get("dateModified", "")
+                    cutoff    = (datetime.now() - timedelta(days=90)).isoformat()
+                    if last_date and last_date < cutoff:
+                        log(f"   ⏹ Досягнуто межі 90 днів")
+                        break
+
+                offset = body.get("next_page", {}).get("offset")
+                if not offset:
+                    break
+
             fallback["newTender"] = True
+            log(f"   ❌ Тендер не знайдено")
             return fallback
     except Exception as e:
         log(f"❌ EXCEPTION get_tender: {type(e).__name__}: {e}")
