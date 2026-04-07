@@ -928,12 +928,16 @@ async function searchByTenderId() {
         return;
     }
 
-    showNotification('🔍 Шукаю тендер...', 'info');
+    showNotification('🔍 Шукаю тендер... (може зайняти кілька секунд)', 'info');
 
     try {
         const res  = await fetch(`/api/tender/${encodeURIComponent(tenderId)}`);
         const data = await res.json();
 
+        if (data.newTender) {
+            showNotification('❌ Тендер не знайдено. Перевірте номер.', 'error');
+            return;
+        }
         showTenderModal(data);
     } catch (e) {
         showNotification('❌ Помилка пошуку', 'error');
