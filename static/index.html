@@ -939,6 +939,9 @@ async function searchByTenderId() {
             return;
         }
         showTenderModal(data);
+        if (data.limited && !data.title) {
+            showNotification('⚠️ Деталі недоступні через API — відкрийте на Prozorro', 'warning');
+        }
     } catch (e) {
         showNotification('❌ Помилка пошуку', 'error');
         console.error(e);
