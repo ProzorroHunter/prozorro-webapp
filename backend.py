@@ -22,8 +22,6 @@ app.add_middleware(
 )
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-
-# Один пошук за раз — щоб не блокувати SQLite
 _search_lock = asyncio.Lock()
 
 
@@ -95,25 +93,66 @@ def make_kw_list(keywords: Optional[str]):
     return [k.strip().lower() for k in keywords.split(",") if k.strip()]
 
 
-def normalize_region(r: str) -> str:
-    return (r.lower()
-             .replace("місто ", "").replace("м. ", "")
-             .replace(" область", "").replace("область", "")
-             .strip())
+def region_matches(searched: str, t_region: str, t_locality: str) -> bool:
+    """
+    Гнучкий матчинг регіону.
+
+    Prozorro зберігає адреси по-різному:
+      - "Київська область" для тендерів з Київщини
+      - "місто Київ"       для тендерів з міста Київ
+      - "Харківська область", locality="Харків" тощо
+
+    Стратегія (перша що спрацювала → True):
+    1. Пряме входження рядка пошуку в повну адресу
+    2. Перші 6 букв збігаються (відсіває " область" / "місто " суфікси)
+    3. Кожне слово довше 4 букв є в адресі
+    """
+    s  = searched.lower().strip()
+    tr = t_region.lower().strip()
+    tl = t_locality.lower().strip()
+    full = f"{tr} {tl}"
+
+    # 1. Пряме входження
+    if s in full:
+        return True
+
+    # Нормалізуємо — прибираємо "область", "місто", "м."
+    def norm(r):
+        return (r.replace("область", "").replace("місто", "")
+                 .replace("м.", "").replace("  ", " ").strip())
+
+    sn   = norm(s)
+    trn  = norm(tr)
+    tln  = norm(tl)
+    fulln = f"{trn} {tln}"
+
+    # 2. Нормалізоване входження
+    if sn and sn in fulln:
+        return True
+    if trn and trn in sn:
+        return True
+
+    # 3. Перші 6 символів нормалізованого рядка
+    if len(sn) >= 6 and (sn[:6] in fulln):
+        return True
+
+    # 4. Кожне смислове слово пошуку є в адресі
+    words = [w for w in sn.split() if len(w) >= 4]
+    if words and all(w in fulln for w in words):
+        return True
+
+    return False
 
 
 def save_tender_now(filter_id: int, tender: dict) -> bool:
-    """
-    Зберігає один тендер у БД одразу після знаходження.
-    Повертає True якщо тендер новий (раніше не зустрічався).
-    """
+    """Зберігає тендер в БД одразу. Повертає True якщо новий."""
     try:
         conn = sqlite3.connect('prozorro.db', timeout=10)
         c = conn.cursor()
         c.execute('SELECT id FROM tenders WHERE id = ?', (tender["id"],))
         if c.fetchone():
             conn.close()
-            return False   # вже є
+            return False
         c.execute(
             '''INSERT OR IGNORE INTO tenders
                (id, title, procuring_entity, amount, cpv, region,
@@ -133,18 +172,13 @@ def save_tender_now(filter_id: int, tender: dict) -> bool:
         conn.close()
         return saved
     except Exception as e:
-        log(f"   ⚠️ Помилка збереження тендера: {e}")
+        log(f"   ⚠️ Помилка збереження: {e}")
         return False
 
 
 async def search_and_save(filter_id: int, keywords=None, cpv=None, region=None,
                           procuring_entity=None, supplier=None,
                           min_amount=None, max_amount=None, period_days=30):
-    """
-    Ключова зміна: тендер зберігається в БД ОДРАЗУ як знайдено,
-    а не після завершення всього пошуку.
-    Це дозволяє UI показувати результати в реальному часі через полінг.
-    """
     date_from = (datetime.now() - timedelta(days=period_days)).isoformat()
     kw_list   = make_kw_list(keywords)
 
@@ -157,12 +191,13 @@ async def search_and_save(filter_id: int, keywords=None, cpv=None, region=None,
     total_listed  = 0
     total_details = 0
     total_saved   = 0
-    offset        = None   # Перша сторінка БЕЗ offset — найсвіжіші тендери
+    region_rejects = 0   # лічильник відмов по регіону (для діагностики)
+    offset = None
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
 
-            for page_num in range(15):
+            for page_num in range(20):   # до 2000 тендерів
 
                 params = {
                     "descending": "1",
@@ -176,14 +211,13 @@ async def search_and_save(filter_id: int, keywords=None, cpv=None, region=None,
                     resp = await client.get(f"{PROZORRO_API}/tenders", params=params)
                     resp.raise_for_status()
                 except Exception as e:
-                    log(f"   ⚠️ Помилка запиту сторінки {page_num+1}: {e}")
+                    log(f"   ⚠️ Помилка запиту стор.{page_num+1}: {e}")
                     break
 
                 body       = resp.json()
                 page_items = body.get("data", [])
-
                 if not page_items:
-                    log(f"   ⏹ Порожня відповідь API")
+                    log(f"   ⏹ Порожня відповідь")
                     break
 
                 total_listed += len(page_items)
@@ -199,14 +233,13 @@ async def search_and_save(filter_id: int, keywords=None, cpv=None, region=None,
                     item_date  = item.get("dateModified", "")
                     list_title = item.get("title", "")
 
-                    # Вийшли за межу часового вікна
                     if item_date and item_date < date_from:
-                        log(f"   ⏹ Межа {period_days} днів досягнута "
+                        log(f"   ⏹ Межа {period_days} днів "
                             f"({item_date[:10]} < {date_from[:10]})")
                         reached_boundary = True
                         break
 
-                    # Швидкий pre-filter по title (без detail-запиту)
+                    # Pre-filter по title
                     if list_title and kw_list:
                         if not any(kw in list_title.lower() for kw in kw_list):
                             continue
@@ -233,29 +266,36 @@ async def search_and_save(filter_id: int, keywords=None, cpv=None, region=None,
 
                     if result["matches"]:
                         items_list = dd.get("items", [])
+                        addr       = dd.get("procuringEntity", {}).get("address", {})
                         tender = {
                             "id":              tender_id,
                             "title":           dd.get("title", "Без назви"),
                             "procuringEntity": dd.get("procuringEntity", {}).get("name", "Невідомо"),
                             "amount":          dd.get("value", {}).get("amount", 0),
                             "cpv":             items_list[0].get("classification", {}).get("id", "") if items_list else "",
-                            "region":          dd.get("procuringEntity", {}).get("address", {}).get("region", ""),
+                            "region":          addr.get("region", ""),
                             "datePublished":   dd.get("datePublished", ""),
                             "url":             f"https://prozorro.gov.ua/tender/{tender_id}",
                         }
-
-                        # ── ЗБЕРІГАЄМО ОДРАЗУ ─────────────────────────────
-                        # Не чекаємо кінця пошуку — UI побачить через 5 сек
                         if save_tender_now(filter_id, tender):
                             total_saved += 1
                             log(f"   ✅ #{total_saved} збережено: {tender['title'][:65]}")
                         else:
-                            log(f"   ⏭ #{tender_id[:20]}... вже є в БД")
+                            log(f"   ⏭ вже є в БД: {tender_id[:20]}...")
 
                         if total_saved >= 10:
-                            log(f"   ⏹ Знайдено максимум (10 тендерів)")
+                            log(f"   ⏹ Знайдено максимум (10)")
                             break
                     else:
+                        # Діагностика регіону — перші 3 відмови по регіону
+                        if region and "Регіон" in result["reason"] and region_rejects < 3:
+                            region_rejects += 1
+                            addr    = dd.get("procuringEntity", {}).get("address", {})
+                            t_reg   = addr.get("region", "N/A")
+                            t_loc   = addr.get("locality", "N/A")
+                            log(f"   🗺 Регіон-відмова #{region_rejects}: "
+                                f"шукали='{region}' | API повернув: region='{t_reg}', locality='{t_loc}'")
+
                         if total_details <= 5:
                             log(f"   ❌ detail #{total_details}: {dd.get('title','')[:50]}")
                             log(f"      → {result['reason']}")
@@ -273,8 +313,9 @@ async def search_and_save(filter_id: int, keywords=None, cpv=None, region=None,
         log(f"❌ КРИТИЧНА ПОМИЛКА: {e}")
         log(traceback.format_exc())
 
-    log(f"   📊 Переглянуто: {total_listed} | Detail-запитів: {total_details}")
-    log(f"   📈 Збережено нових тендерів: {total_saved}\n")
+    log(f"   📊 Переглянуто: {total_listed} | Detail-запитів: {total_details} "
+        f"| Регіон-відмов: {region_rejects}")
+    log(f"   📈 Збережено: {total_saved} нових тендерів\n")
     return total_saved
 
 
@@ -299,13 +340,9 @@ def check_filter_detailed(tender, keywords, cpv, region, procuring_entity,
         addr     = tender.get("procuringEntity", {}).get("address", {})
         t_region = addr.get("region",   "")
         t_local  = addr.get("locality", "")
-        full_loc = (t_region + " " + t_local).lower()
-        r_lower  = region.lower()
-        r_norm   = normalize_region(region)
-        loc_norm = normalize_region(t_region) + " " + normalize_region(t_local)
-        if r_lower not in full_loc and r_norm not in loc_norm:
+        if not region_matches(region, t_region, t_local):
             return {"matches": False,
-                    "reason": f"Регіон: шукаємо '{region}', є '{t_region} {t_local}'"}
+                    "reason": f"Регіон: шукаємо '{region}', є '{t_region} / {t_local}'"}
 
     if procuring_entity:
         entity = tender.get("procuringEntity", {}).get("name", "").lower()
