@@ -481,10 +481,17 @@ async def get_tender_by_id(tender_id: str):
                     return _build_tender_response(tender_id, data, prozorro_url)
 
             # Спроба 2: пошук по tenderID в списку (UA-YYYY-MM-DD-...)
-            # Сканується до 10 сторінок по 100 тендерів
-            log(f"   Шукаю по tenderID у списку...")
+            # Визначаємо дату тендера з номера — зупиняємось на 3 дні раніше
+            date_match = re.match(r'^UA-(\d{4}-\d{2}-\d{2})-', tender_id)
+            cutoff = None
+            if date_match:
+                tender_dt = datetime.fromisoformat(date_match.group(1))
+                cutoff    = (tender_dt - timedelta(days=3)).isoformat()
+                log(f"   Дата з номера: {date_match.group(1)}, зупинка на: {cutoff[:10]}")
+
+            log(f"   Шукаю по tenderID у списку (до 200 сторінок)...")
             offset = None
-            for page in range(10):
+            for page in range(200):
                 params = {
                     "opt_fields": "id,tenderID,title,status,dateModified",
                     "descending": "1",
@@ -499,7 +506,14 @@ async def get_tender_by_id(tender_id: str):
 
                 body  = r.json()
                 items = body.get("data", [])
-                log(f"   Стор.{page+1}: {len(items)} тендерів")
+
+                # На першій сторінці — дивимось що реально повертає API
+                if page == 0 and items:
+                    sample = items[0]
+                    log(f"   DEBUG fields: {list(sample.keys())}")
+                    log(f"   DEBUG item[0]: tenderID={sample.get('tenderID','N/A')} id={sample.get('id','N/A')[:20]}")
+                else:
+                    log(f"   Стор.{page+1}: {len(items)} | last={items[-1].get('dateModified','?')[:10] if items else '?'}")
 
                 for item in items:
                     if item.get("tenderID") == tender_id or item.get("id") == tender_id:
@@ -509,27 +523,25 @@ async def get_tender_by_id(tender_id: str):
                         if rd.status_code == 200:
                             data = rd.json().get("data", {})
                             return _build_tender_response(tender_id, data, prozorro_url)
-                        # detail недоступний — повертаємо часткові дані зі списку
                         return {**fallback, "limited": True,
                                 "title":         item.get("title", ""),
                                 "status":        item.get("status", "unknown"),
                                 "datePublished": get_tender_date(item)}
 
-                # Зупиняємось якщо дата тендерів стала старша за 90 днів
-                if items:
+                # Зупиняємось якщо пройшли дату тендера
+                if cutoff and items:
                     last_date = items[-1].get("dateModified", "")
-                    cutoff    = (datetime.now() - timedelta(days=90)).isoformat()
                     if last_date and last_date < cutoff:
-                        log(f"   ⏹ Досягнуто межі 90 днів")
+                        log(f"   ⏹ Пройшли дату тендера ({last_date[:10]} < {cutoff[:10]})")
                         break
 
                 offset = body.get("next_page", {}).get("offset")
                 if not offset:
                     break
 
-            fallback["newTender"] = True
-            log(f"   ❌ Тендер не знайдено")
-            return fallback
+            # Тендер не знайдено через API — але URL prozorro.gov.ua може працювати
+            log(f"   ⚠️ Не знайдено через API, повертаємо посилання на Prozorro")
+            return {**fallback, "limited": True, "newTender": False}
     except Exception as e:
         log(f"❌ EXCEPTION get_tender: {type(e).__name__}: {e}")
         return fallback
