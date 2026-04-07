@@ -22,7 +22,9 @@ app.add_middleware(
 )
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-_search_lock = asyncio.Lock()
+_search_lock     = asyncio.Lock()
+_active_searches: set = set()   # filter IDs зараз в пошуку
+_queued_searches: set = set()   # filter IDs в черзі (чекають lock)
 
 
 def log(*args):
@@ -87,10 +89,38 @@ class FilterCreate(BaseModel):
 PROZORRO_API = "https://public-api.prozorro.gov.ua/api/2.5"
 
 
+# ── Простий стемер для українських слів ─────────────────────────────────────
+# Дозволяє знаходити "ноутбук" при запиті "ноутбуки" і навпаки.
+_UK_SUFFIXES = tuple(sorted([
+    'ськими', 'зьких', 'зьким', 'ськими', 'ському', 'ській',
+    'ними', 'ому', 'ами', 'ями', 'ків', 'ань', 'ими',
+    'ого', 'ій', 'им', 'ої', 'ів', 'ях', 'ям', 'ою', 'ею', 'ую',
+    'ам', 'ах', 'ий', 'их', 'їх',
+    'и', 'а', 'у', 'і', 'е', 'є', 'ю', 'я', 'ь',
+], key=len, reverse=True))
+
+
+def uk_stem(word: str) -> str:
+    """Видаляє типове українське закінчення → нормалізований корінь."""
+    for suffix in _UK_SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[:-len(suffix)]
+    return word
+
+
 def make_kw_list(keywords: Optional[str]):
     if not keywords:
         return []
-    return [k.strip().lower() for k in keywords.split(",") if k.strip()]
+    result = []
+    for k in keywords.split(","):
+        k = k.strip().lower()
+        if not k:
+            continue
+        result.append(k)
+        stem = uk_stem(k)
+        if stem != k:          # додаємо корінь для відмінкових форм
+            result.append(stem)
+    return list(dict.fromkeys(result))  # унікальні, зберігаємо порядок
 
 
 # ── Таблиця відповідності: область ↔ місто ───────────────────────────────────
@@ -685,9 +715,17 @@ async def get_stats():
     return {"total": total, "today": today_count, "active": active_filters}
 
 
+@app.get("/api/filters/{filter_id}/searching")
+async def is_filter_searching(filter_id: int):
+    return {"searching": filter_id in _active_searches or filter_id in _queued_searches}
+
+
 async def check_filter_task(filter_id: int):
+    _queued_searches.add(filter_id)
     log(f"⏳ Фільтр #{filter_id}: очікую черги...")
     async with _search_lock:
+        _queued_searches.discard(filter_id)
+        _active_searches.add(filter_id)
         log(f"🔒 Фільтр #{filter_id}: починаю")
         try:
             conn = sqlite3.connect('prozorro.db')
@@ -713,6 +751,8 @@ async def check_filter_task(filter_id: int):
         except Exception as e:
             log(f"❌ ПОМИЛКА check_filter_task #{filter_id}: {e}")
             log(traceback.format_exc())
+        finally:
+            _active_searches.discard(filter_id)
 
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
