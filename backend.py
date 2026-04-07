@@ -87,7 +87,6 @@ PROZORRO_API = "https://public-api.prozorro.gov.ua/api/2.5"
 
 async def search_prozorro_tenders(keywords=None, cpv=None, region=None, procuring_entity=None,
                                   supplier=None, min_amount=None, max_amount=None, period_days=30):
-    """Пошук тендерів з детальним логуванням"""
     params = {"descending": "1", "limit": "100"}
     date_from = (datetime.now() - timedelta(days=period_days)).isoformat()
     params["offset"] = date_from
@@ -160,16 +159,12 @@ async def search_prozorro_tenders(keywords=None, cpv=None, region=None, procurin
 
 
 def check_filter_detailed(tender, keywords, cpv, region, procuring_entity, supplier, min_amount, max_amount):
-    """Перевірка з детальним логуванням причин відхилення"""
-
     if keywords:
         title = tender.get("title", "").lower()
         description = tender.get("description", "").lower()
         text = title + " " + description
-
         kw_list = [k.strip().lower() for k in keywords.split(",")]
         found = [kw for kw in kw_list if kw in text]
-
         if not found:
             return {"matches": False, "reason": f"Немає жодного з ключових слів '{keywords}' в тексті"}
 
@@ -184,7 +179,6 @@ def check_filter_detailed(tender, keywords, cpv, region, procuring_entity, suppl
         tender_region = tender.get("procuringEntity", {}).get("address", {}).get("region", "")
         tender_locality = tender.get("procuringEntity", {}).get("address", {}).get("locality", "")
         location = (tender_region + " " + tender_locality).lower()
-
         if region.lower() not in location:
             return {"matches": False, "reason": f"Регіон не співпадає: шукаємо '{region}', знайдено '{tender_region} {tender_locality}'"}
 
@@ -228,7 +222,7 @@ async def health():
 
 @app.get("/api/tender/{tender_id}")
 async def get_tender_by_id(tender_id: str):
-    """Пошук тендера за ID — завжди повертає результат"""
+    """Пошук тендера за ID"""
     print(f"\n🔍 API REQUEST: GET /api/tender/{tender_id}")
 
     try:
@@ -245,6 +239,7 @@ async def get_tender_by_id(tender_id: str):
                 items = data.get("items", [])
                 result = {
                     "id": tender_id,
+                    "limited": False,
                     "title": data.get("title", ""),
                     "procuringEntity": data.get("procuringEntity", {}).get("name", ""),
                     "amount": data.get("value", {}).get("amount", 0),
@@ -273,12 +268,13 @@ async def get_tender_by_id(tender_id: str):
                     t = tenders[0]
                     return {
                         "id": tender_id,
-                        "title": t.get("title", "Перегляньте на сайті Prozorro"),
-                        "procuringEntity": "Завантажте деталі на сайті Prozorro",
+                        "limited": True,
+                        "title": t.get("title", ""),
+                        "procuringEntity": "",
                         "amount": 0,
                         "currency": "UAH",
                         "status": t.get("status", "unknown"),
-                        "datePublished": "",
+                        "datePublished": t.get("datePublished", ""),
                         "region": "",
                         "locality": "",
                         "cpv": "",
@@ -287,11 +283,12 @@ async def get_tender_by_id(tender_id: str):
                     }
 
             # СПРОБА 3: Просто посилання
-            print(f"⚠️ API не знайшов даних, повертаємо посилання\n")
+            print(f"⚠️ API не знайшов даних\n")
             return {
                 "id": tender_id,
-                "title": f"Тендер {tender_id}",
-                "procuringEntity": "Перегляньте деталі на сайті Prozorro",
+                "limited": True,
+                "title": "",
+                "procuringEntity": "",
                 "amount": 0,
                 "currency": "UAH",
                 "status": "unknown",
@@ -308,8 +305,9 @@ async def get_tender_by_id(tender_id: str):
         print(traceback.format_exc())
         return {
             "id": tender_id,
-            "title": f"Тендер {tender_id}",
-            "procuringEntity": "Перегляньте деталі на сайті Prozorro",
+            "limited": True,
+            "title": "",
+            "procuringEntity": "",
             "amount": 0,
             "currency": "UAH",
             "status": "unknown",
@@ -331,7 +329,6 @@ async def get_filters():
                  FROM filters WHERE is_active = 1 ORDER BY id''')
     rows = c.fetchall()
     conn.close()
-
     return [
         {
             "id": row[0], "name": row[1], "keywords": row[2], "cpv": row[3],
@@ -358,7 +355,6 @@ async def create_filter(filter_data: FilterCreate, background_tasks: BackgroundT
     filter_id = c.lastrowid
     conn.commit()
     conn.close()
-
     print(f"\n✅ Створено фільтр #{filter_id}: {filter_data.name}\n")
     background_tasks.add_task(check_filter_task, filter_id)
     return {"id": filter_id, "message": "Фільтр створено"}
@@ -382,37 +378,28 @@ async def delete_filter(filter_id: int):
     return {"message": "Фільтр видалено"}
 
 
-# ── Tenders ────────────────────────────────────────────
-
 @app.get("/api/tenders")
 async def get_tenders(limit: int = 200, filter_id: Optional[int] = None):
-    """Список тендерів. Якщо filter_id задано — тільки для цього фільтра."""
     conn = sqlite3.connect('prozorro.db')
     c = conn.cursor()
-
     if filter_id:
         c.execute(
             '''SELECT t.id, t.title, t.procuring_entity, t.amount, t.cpv, t.region,
                       t.date_published, t.url, t.filter_id, f.name
-               FROM tenders t
-               LEFT JOIN filters f ON t.filter_id = f.id
-               WHERE t.filter_id = ?
-               ORDER BY t.date_published DESC LIMIT ?''',
+               FROM tenders t LEFT JOIN filters f ON t.filter_id = f.id
+               WHERE t.filter_id = ? ORDER BY t.date_published DESC LIMIT ?''',
             (filter_id, limit)
         )
     else:
         c.execute(
             '''SELECT t.id, t.title, t.procuring_entity, t.amount, t.cpv, t.region,
                       t.date_published, t.url, t.filter_id, f.name
-               FROM tenders t
-               LEFT JOIN filters f ON t.filter_id = f.id
+               FROM tenders t LEFT JOIN filters f ON t.filter_id = f.id
                ORDER BY t.date_published DESC LIMIT ?''',
             (limit,)
         )
-
     rows = c.fetchall()
     conn.close()
-
     return [
         {
             "id": row[0], "title": row[1], "procuringEntity": row[2],
@@ -426,7 +413,6 @@ async def get_tenders(limit: int = 200, filter_id: Optional[int] = None):
 
 @app.delete("/api/tenders/all")
 async def clear_all_tenders():
-    """Очистити всі знайдені тендери"""
     conn = sqlite3.connect('prozorro.db')
     c = conn.cursor()
     c.execute('DELETE FROM tenders')
@@ -439,7 +425,6 @@ async def clear_all_tenders():
 
 @app.delete("/api/tenders/filter/{filter_id}")
 async def clear_filter_tenders(filter_id: int):
-    """Очистити тендери конкретного фільтра"""
     conn = sqlite3.connect('prozorro.db')
     c = conn.cursor()
     c.execute('DELETE FROM tenders WHERE filter_id = ?', (filter_id,))
@@ -465,10 +450,7 @@ async def get_stats():
     return {"total": total, "today": today_count, "active": active_filters}
 
 
-# ── Background task ─────────────────────────────────────
-
 async def check_filter_task(filter_id: int):
-    """Фонова задача: перевірка фільтра та збереження тендерів"""
     conn = sqlite3.connect('prozorro.db')
     c = conn.cursor()
     c.execute(
