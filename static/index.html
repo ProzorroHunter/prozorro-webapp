@@ -58,6 +58,7 @@
         }
 
         .btn:hover { transform: translateY(-2px); box-shadow: 0 10px 30px rgba(99,102,241,0.5); }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
 
         .btn-small    { padding: 8px 16px; font-size: 0.875rem; }
         .btn-success  { background: linear-gradient(135deg, #10b981, #059669); }
@@ -126,6 +127,11 @@
             background: rgba(99,102,241,0.1);
         }
 
+        .filter-card.searching {
+            border-color: rgba(245,158,11,0.5);
+            background: rgba(245,158,11,0.05);
+        }
+
         .filter-card h3 { margin-bottom: 10px; padding-right: 30px; }
 
         .filter-delete {
@@ -162,6 +168,36 @@
             display: flex;
             gap: 8px;
             flex-wrap: wrap;
+            align-items: center;
+        }
+
+        /* Searching state indicator */
+        .searching-indicator {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: #fbbf24;
+            font-size: 0.82rem;
+        }
+
+        .dot-pulse {
+            display: inline-flex;
+            gap: 3px;
+        }
+
+        .dot-pulse span {
+            width: 5px; height: 5px;
+            background: #fbbf24;
+            border-radius: 50%;
+            animation: pulse 1.2s ease-in-out infinite;
+        }
+
+        .dot-pulse span:nth-child(2) { animation-delay: 0.2s; }
+        .dot-pulse span:nth-child(3) { animation-delay: 0.4s; }
+
+        @keyframes pulse {
+            0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+            40% { transform: scale(1); opacity: 1; }
         }
 
         .tenders-section { margin-bottom: 30px; }
@@ -328,7 +364,6 @@
         }
 
         .tender-info-value { font-size: 0.95rem; font-weight: 500; }
-
         .tender-amount-value { font-size: 1.3rem; font-weight: 700; color: #10b981; }
 
         .status-badge {
@@ -356,7 +391,6 @@
 
         @keyframes spin { to { transform: rotate(360deg); } }
 
-        /* Notice blocks */
         .notice {
             border-radius: 12px;
             padding: 20px;
@@ -364,15 +398,8 @@
             grid-column: 1 / -1;
         }
 
-        .notice-warning {
-            background: rgba(245,158,11,0.1);
-            border: 1px solid rgba(245,158,11,0.3);
-        }
-
-        .notice-info {
-            background: rgba(59,130,246,0.1);
-            border: 1px solid rgba(59,130,246,0.3);
-        }
+        .notice-warning { background: rgba(245,158,11,0.1); border: 1px solid rgba(245,158,11,0.3); }
+        .notice-info    { background: rgba(59,130,246,0.1);  border: 1px solid rgba(59,130,246,0.3); }
 
         .notice-icon  { font-size: 2rem; margin-bottom: 10px; }
         .notice-title { font-size: 1rem; font-weight: 600; margin-bottom: 8px; }
@@ -693,11 +720,17 @@
 
 
 <script>
+// ─── State ─────────────────────────────────────────────
 let allFilters      = [];
 let allTenders      = [];
 let currentTab      = 'all';
 let deleteFilterId  = null;
 let clearFilterTarget = null;
+
+// Відстежуємо які фільтри зараз в процесі пошуку
+const searchingFilters = new Set();
+
+// ─── Load ──────────────────────────────────────────────
 
 async function loadData() {
     await loadStats();
@@ -727,6 +760,8 @@ async function loadTendersData() {
     catch(e) { allTenders = []; }
 }
 
+// ─── Render: Filters ──────────────────────────────────
+
 function renderFilters() {
     const grid = document.getElementById('filtersGrid');
     if (!allFilters.length) {
@@ -735,10 +770,12 @@ function renderFilters() {
         return;
     }
     grid.innerHTML = allFilters.map(f => {
-        const count = allTenders.filter(t => t.filterId === f.id).length;
-        const sel   = currentTab === f.id;
+        const count     = allTenders.filter(t => t.filterId === f.id).length;
+        const sel       = currentTab === f.id;
+        const searching = searchingFilters.has(f.id);
         return `
-        <div class="filter-card glass ${sel ? 'selected' : ''}" onclick="switchTab(${f.id})">
+        <div class="filter-card glass ${sel ? 'selected' : ''} ${searching ? 'searching' : ''}"
+             onclick="switchTab(${f.id})">
             <div class="filter-delete"
                  onclick="event.stopPropagation(); askDeleteFilter(${f.id}, '${escHtml(f.name)}')"
                  title="Видалити фільтр">×</div>
@@ -757,16 +794,29 @@ function renderFilters() {
                 </span>
             </div>
             <div class="filter-actions" onclick="event.stopPropagation()">
-                <button class="btn btn-small btn-success" onclick="searchNow(${f.id})">🔍 Шукати зараз</button>
-                ${count > 0
+                ${searching
+                    ? `<span class="searching-indicator">
+                           <span class="dot-pulse">
+                               <span></span><span></span><span></span>
+                           </span>
+                           Пошук...
+                       </span>`
+                    : `<button class="btn btn-small btn-success" onclick="searchNow(${f.id}, this)">
+                           🔍 Шукати зараз
+                       </button>`
+                }
+                ${count > 0 && !searching
                     ? `<button class="btn btn-small btn-danger"
                                onclick="askClearFilter(${f.id},'${escHtml(f.name)}')">
-                               🗑️ Очистити список</button>`
+                               🗑️ Очистити список
+                       </button>`
                     : ''}
             </div>
         </div>`;
     }).join('');
 }
+
+// ─── Render: Tabs ──────────────────────────────────────
 
 function renderTabs() {
     const row = document.getElementById('tabsRow');
@@ -782,12 +832,14 @@ function renderTabs() {
             ${count > 0
                 ? `<span class="tab-x"
                          onclick="event.stopPropagation();askClearFilter(${f.id},'${escHtml(f.name)}')"
-                         title="Очистити тендери цього фільтра">✕</span>`
+                         title="Очистити">✕</span>`
                 : ''}
         </button>`;
     });
     row.innerHTML = html;
 }
+
+// ─── Render: Table ──────────────────────────────────────
 
 function renderTendersTable() {
     const tbody = document.getElementById('tendersTable');
@@ -796,11 +848,17 @@ function renderTendersTable() {
         : allTenders.filter(t => t.filterId === currentTab);
 
     if (!list.length) {
-        const msg = currentTab === 'all'
-            ? 'Тендерів ще не знайдено. Натисніть «🔍 Шукати зараз» або створіть фільтр.'
-            : 'Для цього фільтра поки не знайдено тендерів.';
+        const isSearching = currentTab !== 'all' && searchingFilters.has(currentTab);
+        const msg = isSearching
+            ? '🔍 Пошук виконується... Результати з\'являться автоматично.'
+            : currentTab === 'all'
+                ? 'Тендерів ще не знайдено. Натисніть «🔍 Шукати зараз» або створіть фільтр.'
+                : 'Для цього фільтра поки не знайдено тендерів.';
         tbody.innerHTML = `<tr><td colspan="8">
-            <div class="empty-state"><div class="empty-icon">📭</div><div>${msg}</div></div>
+            <div class="empty-state">
+                <div class="empty-icon">${isSearching ? '⏳' : '📭'}</div>
+                <div>${msg}</div>
+            </div>
         </td></tr>`;
         renderTabs();
         return;
@@ -831,7 +889,7 @@ function switchTab(tab) {
     renderTendersTable();
 }
 
-// ── Search by tender ID ────────────────────────────────
+// ─── Search by ID ──────────────────────────────────────
 
 function openTenderModalLoading(tenderId) {
     document.getElementById('tenderModalId').textContent    = tenderId;
@@ -854,121 +912,71 @@ function openTenderModalLoading(tenderId) {
 
 async function searchByTenderId() {
     const tenderId = document.getElementById('tenderIdSearch').value.trim();
-    if (!tenderId) {
-        showNotification('Введіть номер тендера', 'error');
-        return;
-    }
+    if (!tenderId) { showNotification('Введіть номер тендера', 'error'); return; }
 
     openTenderModalLoading(tenderId);
 
     try {
         const res = await fetch(`/api/tender/${encodeURIComponent(tenderId)}`);
-
         let data;
-        try {
-            data = await res.json();
-        } catch {
-            // Сервер повернув не-JSON (помилка Render або інша)
-            data = {
-                id: tenderId, limited: true, newTender: true,
-                title: '', procuringEntity: '', amount: 0,
-                currency: 'UAH', status: 'unknown',
-                datePublished: '', region: '', locality: '',
-                cpv: '', cpvDescription: '',
-                url: `https://prozorro.gov.ua/tender/${tenderId}`
-            };
-        }
-
+        try { data = await res.json(); }
+        catch { data = { id: tenderId, limited: true, newTender: true, title: '', procuringEntity: '',
+                         amount: 0, currency: 'UAH', status: 'unknown', datePublished: '',
+                         region: '', locality: '', cpv: '', cpvDescription: '',
+                         url: `https://prozorro.gov.ua/tender/${tenderId}` }; }
         showTenderModal(data);
-
     } catch(e) {
-        console.error('searchByTenderId error:', e);
-        // Мережева помилка → показуємо модалку з посиланням
-        showTenderModal({
-            id: tenderId, limited: true, newTender: true,
-            title: '', procuringEntity: '', amount: 0,
-            currency: 'UAH', status: 'unknown',
-            datePublished: '', region: '', locality: '',
-            cpv: '', cpvDescription: '',
-            url: `https://prozorro.gov.ua/tender/${tenderId}`
-        });
+        showTenderModal({ id: tenderId, limited: true, newTender: true, title: '',
+                          procuringEntity: '', amount: 0, currency: 'UAH', status: 'unknown',
+                          datePublished: '', region: '', locality: '', cpv: '', cpvDescription: '',
+                          url: `https://prozorro.gov.ua/tender/${tenderId}` });
     }
 }
 
 function showTenderModal(data) {
     document.getElementById('tenderModalId').textContent = data.id || '';
-
     const grid    = document.getElementById('tenderInfoGrid');
     const actions = document.getElementById('tenderModalActions');
-
     const backBtn = `<button class="btn-secondary" onclick="closeTenderModal()">← Назад</button>`;
 
-    const prozorroBtn = (label = '🔗 Відкрити на Prozorro') =>
-        `<a href="${escHtml(data.url)}" target="_blank"
-            class="btn btn-success" style="text-decoration:none;">${label}</a>`;
-
-    // ── Якщо API не повернув дані ──────────────────────
     if (data.limited) {
-
-        // Визначаємо причину: новий тендер (затримка API) чи інша
-        const isNew = data.newTender;
-
         document.getElementById('tenderModalTitle').textContent =
-            isNew ? 'Тендер ще не в базі API' : 'Дані з API недоступні';
+            data.newTender ? 'Тендер ще не в базі API' : 'Дані з API недоступні';
 
-        const noticeClass = isNew ? 'notice-info' : 'notice-warning';
-        const noticeIcon  = isNew ? '🕐' : '⚠️';
-        const noticeTitle = isNew
-            ? 'Тендер щойно створено — API ще не проіндексував'
-            : 'Prozorro API не видав деталі для цього тендера';
-        const noticeText  = isNew
-            ? `Prozorro Public API оновлюється з затримкою <strong>від кількох годин до доби</strong>
-               після створення тендера.<br>
-               Сайт prozorro.gov.ua вже показує тендер — перейдіть за посиланням нижче.<br>
-               Або спробуйте пошук знову через кілька годин.`
-            : `Тендер може бути в стадії планування, скасований або тимчасово недоступний.
-               Посилання на офіційний сайт коректне — перейдіть та перегляньте там.`;
-
-        const hasTitle  = data.title && data.title.trim();
-        const hasStatus = data.status && data.status !== 'unknown';
-
+        const isNew = data.newTender;
         grid.innerHTML = `
-            <div class="notice ${noticeClass}" style="grid-column:1/-1;">
-                <div class="notice-icon">${noticeIcon}</div>
-                <div class="notice-title">${noticeTitle}</div>
-                <div class="notice-text">${noticeText}</div>
+            <div class="notice ${isNew ? 'notice-info' : 'notice-warning'}" style="grid-column:1/-1;">
+                <div class="notice-icon">${isNew ? '🕐' : '⚠️'}</div>
+                <div class="notice-title">
+                    ${isNew ? 'Тендер щойно створено — API ще не проіндексував'
+                            : 'Prozorro API не видав деталі для цього тендера'}
+                </div>
+                <div class="notice-text">
+                    ${isNew
+                        ? `Prozorro Public API оновлюється з затримкою від кількох годин до доби.<br>
+                           Сайт prozorro.gov.ua вже показує тендер — перейдіть за посиланням.`
+                        : `Тендер може бути в стадії планування або тимчасово недоступний.
+                           Посилання на офіційний сайт коректне.`}
+                </div>
             </div>
-            ${hasTitle ? `
-            <div class="tender-info-item">
-                <div class="tender-info-label">Назва (часткова)</div>
-                <div class="tender-info-value">${escHtml(data.title)}</div>
-            </div>` : ''}
-            ${hasStatus ? `
-            <div class="tender-info-item">
-                <div class="tender-info-label">Статус</div>
-                <div class="tender-info-value">${escHtml(data.status)}</div>
-            </div>` : ''}
+            ${data.title ? `<div class="tender-info-item"><div class="tender-info-label">Назва</div>
+                <div class="tender-info-value">${escHtml(data.title)}</div></div>` : ''}
         `;
-
-        actions.innerHTML = `
-            ${backBtn}
+        actions.innerHTML = `${backBtn}
             <a href="${escHtml(data.url)}" target="_blank"
-               class="btn btn-success"
-               style="text-decoration:none;flex:1;text-align:center;">
+               class="btn btn-success" style="text-decoration:none;flex:1;text-align:center;">
                 🔗 Відкрити тендер на Prozorro →
             </a>`;
         return;
     }
 
-    // ── Повні дані ──────────────────────────────────────
     document.getElementById('tenderModalTitle').textContent = data.title || '(назва недоступна)';
 
     const statusMap = {
-        active:       ['✅ Активний',     'status-active'],
-        complete:     ['🏁 Завершений',   'status-complete'],
-        cancelled:    ['❌ Скасований',   'status-cancelled'],
-        unsuccessful: ['⚠️ Не відбувся', 'status-unsuccessful'],
-        unknown:      ['❓ Невідомо',     'status-unknown'],
+        active: ['✅ Активний','status-active'], complete: ['🏁 Завершений','status-complete'],
+        cancelled: ['❌ Скасований','status-cancelled'],
+        unsuccessful: ['⚠️ Не відбувся','status-unsuccessful'],
+        unknown: ['❓ Невідомо','status-unknown'],
     };
     const [statusLabel, statusClass] = statusMap[data.status] || statusMap.unknown;
 
@@ -991,42 +999,73 @@ function showTenderModal(data) {
                 ${escHtml([data.region, data.locality].filter(Boolean).join(', ') || '—')}
             </div>
         </div>
-        ${data.cpv ? `
-        <div class="tender-info-item">
+        ${data.cpv ? `<div class="tender-info-item">
             <div class="tender-info-label">CPV код</div>
             <div class="tender-info-value" style="font-family:monospace;">${escHtml(data.cpv)}</div>
         </div>` : ''}
-        ${data.cpvDescription ? `
-        <div class="tender-info-item">
+        ${data.cpvDescription ? `<div class="tender-info-item">
             <div class="tender-info-label">Категорія</div>
             <div class="tender-info-value">${escHtml(data.cpvDescription)}</div>
         </div>` : ''}
-        ${data.datePublished ? `
-        <div class="tender-info-item">
+        ${data.datePublished ? `<div class="tender-info-item">
             <div class="tender-info-label">Дата публікації</div>
             <div class="tender-info-value">${formatDate(data.datePublished)}</div>
         </div>` : ''}
     `;
-
-    actions.innerHTML = `${backBtn}${prozorroBtn()}`;
+    actions.innerHTML = `${backBtn}
+        <a href="${escHtml(data.url)}" target="_blank"
+           class="btn btn-success" style="text-decoration:none;">🔗 Відкрити на Prozorro</a>`;
 }
 
 function closeTenderModal() {
     document.getElementById('tenderModal').classList.remove('active');
 }
 
-// ── Filter CRUD ────────────────────────────────────────
+// ─── Search now (with polling) ──────────────────────────
 
-async function searchNow(filterId) {
-    showNotification('🔍 Запускаю пошук...', 'info');
+async function searchNow(filterId, btn) {
+    // Ставимо фільтр у стан "searching"
+    searchingFilters.add(filterId);
+    renderFilters();
+
+    showNotification('🔍 Пошук запущено...', 'info');
+
     try {
         await fetch(`/api/filters/${filterId}/search`, { method: 'POST' });
-        showNotification('✅ Пошук запущено! Оновлю через 8 сек...');
-        setTimeout(loadData, 8000);
     } catch(e) {
-        showNotification('⏳ Пошук запущено у фоні', 'info');
+        // ignore — сервер все одно запустив задання
     }
+
+    // Запам'ятовуємо початкову кількість тендерів для цього фільтра
+    const countBefore = allTenders.filter(t => t.filterId === filterId).length;
+
+    // Полінг кожні 5 секунд до 90 секунд
+    let attempts = 0;
+    const maxAttempts = 18;   // 18 × 5 = 90 сек
+
+    const poll = setInterval(async () => {
+        attempts++;
+        await loadData();
+
+        const countAfter = allTenders.filter(t => t.filterId === filterId).length;
+        const found = countAfter - countBefore;
+
+        if (found > 0) {
+            clearInterval(poll);
+            searchingFilters.delete(filterId);
+            renderFilters();
+            showNotification(`✅ Знайдено ${found} нових тендерів!`);
+        } else if (attempts >= maxAttempts) {
+            clearInterval(poll);
+            searchingFilters.delete(filterId);
+            renderFilters();
+            showNotification('⚠️ Пошук завершено. Нових тендерів не знайдено.', 'warning');
+        }
+        // Якщо нічого не знайдено і час ще є — продовжуємо полінг
+    }, 5000);
 }
+
+// ─── Filter CRUD ───────────────────────────────────────
 
 function askDeleteFilter(id, name) {
     deleteFilterId = id;
@@ -1048,12 +1087,11 @@ async function confirmDelete() {
             await fetch(`/api/tenders/filter/${deleteFilterId}`, { method: 'DELETE' });
         }
         if (currentTab === deleteFilterId) currentTab = 'all';
+        searchingFilters.delete(deleteFilterId);
         showNotification('✅ Фільтр видалено');
         closeConfirm();
         await loadData();
-    } catch(e) {
-        showNotification('❌ Помилка видалення', 'error');
-    }
+    } catch(e) { showNotification('❌ Помилка видалення', 'error'); }
 }
 
 function closeConfirm() {
@@ -1089,15 +1127,15 @@ async function confirmClearAll() {
         }
         closeClearAll();
         await loadData();
-    } catch(e) {
-        showNotification('❌ Помилка очищення', 'error');
-    }
+    } catch(e) { showNotification('❌ Помилка очищення', 'error'); }
 }
 
 function closeClearAll() {
     document.getElementById('clearAllModal').classList.remove('active');
     clearFilterTarget = null;
 }
+
+// ─── Filter form ───────────────────────────────────────
 
 function openModal()  { document.getElementById('filterModal').classList.add('active'); }
 function closeModal() {
@@ -1126,15 +1164,38 @@ document.getElementById('filterForm').addEventListener('submit', async (e) => {
         });
         if (res.ok) {
             const created = await res.json();
-            showNotification('✅ Фільтр створено! Пошук запущено...');
             closeModal();
             currentTab = created.id;
-            setTimeout(loadData, 3000);
+            await loadData();
+
+            // Позначаємо новий фільтр як "шукає" і запускаємо полінг
+            searchingFilters.add(created.id);
+            renderFilters();
+            showNotification('✅ Фільтр створено! Пошук запущено...', 'info');
+
+            const countBefore = 0;
+            let attempts = 0;
+            const poll = setInterval(async () => {
+                attempts++;
+                await loadData();
+                const countAfter = allTenders.filter(t => t.filterId === created.id).length;
+                if (countAfter > countBefore) {
+                    clearInterval(poll);
+                    searchingFilters.delete(created.id);
+                    renderFilters();
+                    showNotification(`✅ Знайдено ${countAfter} тендерів для нового фільтра!`);
+                } else if (attempts >= 18) {
+                    clearInterval(poll);
+                    searchingFilters.delete(created.id);
+                    renderFilters();
+                    showNotification('ℹ️ Пошук завершено. Спробуйте «Шукати зараз».', 'info');
+                }
+            }, 5000);
         }
-    } catch(e) {
-        showNotification('❌ Помилка створення фільтра', 'error');
-    }
+    } catch(e) { showNotification('❌ Помилка створення фільтра', 'error'); }
 });
+
+// ─── Helpers ───────────────────────────────────────────
 
 function formatAmount(amount) {
     if (!amount) return '—';
@@ -1156,11 +1217,8 @@ function formatDate(dateString) {
 function escHtml(str) {
     if (!str) return '';
     return String(str)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function showNotification(message, type = 'success') {
@@ -1168,7 +1226,7 @@ function showNotification(message, type = 'success') {
     n.className   = `notification ${type}`;
     n.textContent = message;
     document.body.appendChild(n);
-    setTimeout(() => n.remove(), 3500);
+    setTimeout(() => n.remove(), 4000);
 }
 
 document.querySelectorAll('.modal').forEach(m => {
