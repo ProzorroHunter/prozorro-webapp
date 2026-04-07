@@ -563,6 +563,26 @@ async def get_filters():
             for r in rows]
 
 
+@app.put("/api/filters/{filter_id}")
+async def update_filter(filter_id: int, filter_data: FilterCreate, background_tasks: BackgroundTasks):
+    conn = sqlite3.connect('prozorro.db')
+    c = conn.cursor()
+    c.execute(
+        '''UPDATE filters SET name=?, keywords=?, cpv=?, region=?, procuring_entity=?,
+           supplier=?, min_amount=?, max_amount=?, period_days=?
+           WHERE id=? AND is_active=1''',
+        (filter_data.name, filter_data.keywords, filter_data.cpv,
+         filter_data.region, filter_data.procuringEntity, filter_data.supplier,
+         filter_data.minAmount, filter_data.maxAmount, filter_data.periodDays,
+         filter_id)
+    )
+    conn.commit()
+    conn.close()
+    log(f"\n✏️ Оновлено фільтр #{filter_id}: {filter_data.name}\n")
+    background_tasks.add_task(check_filter_task, filter_id)
+    return {"id": filter_id, "message": "Фільтр оновлено"}
+
+
 @app.post("/api/filters")
 async def create_filter(filter_data: FilterCreate, background_tasks: BackgroundTasks):
     conn = sqlite3.connect('prozorro.db')

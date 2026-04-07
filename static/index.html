@@ -155,13 +155,38 @@
 
         .filter-card h3 {
             margin-bottom: 10px;
-            padding-right: 30px;
+            padding-right: 68px;
+        }
+
+        .filter-card-top-btns {
+            position: absolute;
+            top: 13px;
+            right: 13px;
+            display: flex;
+            gap: 5px;
+        }
+
+        .filter-edit {
+            background: rgba(99, 102, 241, 0.2);
+            border: 1px solid rgba(99, 102, 241, 0.3);
+            color: #a5b4fc;
+            width: 28px;
+            height: 28px;
+            border-radius: 6px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
+
+        .filter-edit:hover {
+            background: rgba(99, 102, 241, 0.4);
+            transform: scale(1.1);
         }
 
         .filter-delete {
-            position: absolute;
-            top: 15px;
-            right: 15px;
             background: rgba(239, 68, 68, 0.2);
             border: 1px solid rgba(239, 68, 68, 0.3);
             color: #ef4444;
@@ -810,6 +835,7 @@ let deleteFilterId = null;
 
 const searchingFilters   = new Set(); // filter IDs currently searching
 const nothingFoundFilters = new Set(); // filter IDs where last search found 0
+let editFilterId = null; // null = create mode, number = edit mode
 
 // ─── Load ─────────────────────────────────────────────
 
@@ -863,7 +889,10 @@ function renderFilters() {
         const isSelected = currentTab === f.id;
         return `
         <div class="filter-card glass ${isSelected ? 'selected' : ''}" onclick="switchTab(${f.id})">
-            <div class="filter-delete" onclick="event.stopPropagation(); askDeleteFilter(${f.id}, '${escHtml(f.name)}')" title="Видалити фільтр">×</div>
+            <div class="filter-card-top-btns" onclick="event.stopPropagation()">
+                <div class="filter-edit" onclick="openEditModal(${f.id})" title="Редагувати фільтр">✏️</div>
+                <div class="filter-delete" onclick="askDeleteFilter(${f.id}, '${escHtml(f.name)}')" title="Видалити фільтр">×</div>
+            </div>
             <h3>${escHtml(f.name)}</h3>
             ${f.keywords       ? `<div class="filter-tag">🔑 ${escHtml(f.keywords)}</div>` : ''}
             ${f.cpv            ? `<div class="filter-tag">📦 CPV: ${escHtml(f.cpv)}</div>` : ''}
@@ -1193,10 +1222,38 @@ function closeClearAll() {
 
 // ─── Filter form ───────────────────────────────────────
 
-function openModal()  { document.getElementById('filterModal').classList.add('active'); }
+function openModal() {
+    editFilterId = null;
+    document.querySelector('#filterModal h2').textContent = '✨ Новий фільтр пошуку';
+    document.querySelector('#filterModal [type="submit"]').textContent = '✨ Створити та шукати';
+    document.getElementById('filterForm').reset();
+    document.getElementById('filterModal').classList.add('active');
+}
+
+function openEditModal(filterId) {
+    const f = allFilters.find(f => f.id === filterId);
+    if (!f) return;
+    editFilterId = filterId;
+
+    document.getElementById('filterName').value            = f.name            || '';
+    document.getElementById('filterKeywords').value        = f.keywords        || '';
+    document.getElementById('filterCpv').value             = f.cpv             || '';
+    document.getElementById('filterRegion').value          = f.region          || '';
+    document.getElementById('filterProcuringEntity').value = f.procuringEntity || '';
+    document.getElementById('filterSupplier').value        = f.supplier        || '';
+    document.getElementById('filterPeriod').value          = f.periodDays      || 30;
+    document.getElementById('filterMinAmount').value       = f.minAmount       || '';
+    document.getElementById('filterMaxAmount').value       = f.maxAmount       || '';
+
+    document.querySelector('#filterModal h2').textContent = '✏️ Редагувати фільтр';
+    document.querySelector('#filterModal [type="submit"]').textContent = '💾 Зберегти та шукати';
+    document.getElementById('filterModal').classList.add('active');
+}
+
 function closeModal() {
     document.getElementById('filterModal').classList.remove('active');
     document.getElementById('filterForm').reset();
+    editFilterId = null;
 }
 
 document.getElementById('filterForm').addEventListener('submit', async (e) => {
@@ -1215,21 +1272,42 @@ document.getElementById('filterForm').addEventListener('submit', async (e) => {
     };
 
     try {
-        const res = await fetch('/api/filters', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(filter),
-        });
-        if (res.ok) {
-            const created = await res.json();
-            showNotification('✅ Фільтр створено! Пошук запущено...');
-            closeModal();
-            // переключаємо на вкладку нового фільтра після завантаження
-            currentTab = created.id;
-            setTimeout(() => loadData(), 3000);
+        if (editFilterId !== null) {
+            // Режим редагування
+            const res = await fetch(`/api/filters/${editFilterId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(filter),
+            });
+            if (res.ok) {
+                const updated = await res.json();
+                showNotification('✅ Фільтр оновлено! Запускаю пошук...');
+                const targetId = updated.id;
+                closeModal();
+                await loadData();
+                currentTab = targetId;
+                renderFilters();
+                renderTabs();
+                renderTendersTable();
+                searchNow(targetId);
+            }
+        } else {
+            // Режим створення
+            const res = await fetch('/api/filters', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(filter),
+            });
+            if (res.ok) {
+                const created = await res.json();
+                showNotification('✅ Фільтр створено! Пошук запущено...');
+                closeModal();
+                currentTab = created.id;
+                setTimeout(() => loadData(), 3000);
+            }
         }
     } catch (e) {
-        showNotification('❌ Помилка створення фільтра', 'error');
+        showNotification('❌ Помилка збереження фільтра', 'error');
     }
 });
 
