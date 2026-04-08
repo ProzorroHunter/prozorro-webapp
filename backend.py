@@ -611,8 +611,9 @@ async def get_tender_by_id(tender_id: str):
                 return {**fallback, "limited": True, "newTender": False}
 
             tender_date = date_match.group(1)
-            stop_after  = (datetime.fromisoformat(tender_date) + timedelta(days=3)).isoformat()
-            log(f"   Спроба 4: ascending+detail від {tender_date}...")
+            # Зупинка — сьогодні + 1 день (тендер міг бути змінений в будь-який день)
+            stop_after  = (datetime.now() + timedelta(days=1)).isoformat()
+            log(f"   Спроба 4: ascending+detail від {tender_date} до сьогодні...")
 
             sem = asyncio.Semaphore(15)  # 15 паралельних detail-запитів
 
@@ -627,7 +628,7 @@ async def get_tender_by_id(tender_id: str):
                 return {}
 
             offset = tender_date + "T00:00:00"
-            for page in range(40):
+            for page in range(100):  # до 10 000 тендерів
                 r = await client.get(f"{PROZORRO_API}/tenders", params={
                     "opt_fields": "id,dateModified",
                     "limit":      "100",
@@ -641,7 +642,7 @@ async def get_tender_by_id(tender_id: str):
                     break
 
                 last_date = items[-1].get("dateModified", "")
-                log(f"   Стор.{page+1}: {len(items)} | {items[0].get('dateModified','?')[:10]}→{last_date[:10]} +detail")
+                log(f"   Стор.{page+1}: {len(items)} | {items[0].get('dateModified','?')[:10]}→{last_date[:10]}")
 
                 details = await asyncio.gather(*[fetch_detail(it["id"]) for it in items])
                 for detail in details:
@@ -650,7 +651,6 @@ async def get_tender_by_id(tender_id: str):
                         return _build_tender_response(tender_id, detail, prozorro_url)
 
                 if last_date and last_date > stop_after:
-                    log(f"   ⏹ Пройшли +3 дні")
                     break
 
                 offset = body.get("next_page", {}).get("offset")
