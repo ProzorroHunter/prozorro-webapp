@@ -540,22 +540,29 @@ async def health():
 
 
 def _build_tender_response(tender_id: str, data: dict, prozorro_url: str, limited: bool = False) -> dict:
-    items = data.get("items", [])
-    addr  = data.get("procuringEntity", {}).get("address", {})
+    # Безпечне розпакування — Prozorro API може повертати null для деяких полів
+    items = data.get("items") or []
+    pe    = data.get("procuringEntity") or {}
+    addr  = pe.get("address") or {}
+    value = data.get("value") or {}
+    clf   = (items[0].get("classification") or {}) if items else {}
+    title  = data.get("title", "")
+    status = data.get("status", "")
+    log(f"   _build: title='{title[:60]}' status='{status}' pe='{pe.get('name','')[:40]}'")
     return {
         "id":              tender_id,
         "limited":         limited,
         "newTender":       False,
-        "title":           data.get("title", ""),
-        "procuringEntity": data.get("procuringEntity", {}).get("name", ""),
-        "amount":          data.get("value", {}).get("amount", 0),
-        "currency":        data.get("value", {}).get("currency", "UAH"),
-        "status":          data.get("status", ""),
+        "title":           title,
+        "procuringEntity": pe.get("name", ""),
+        "amount":          value.get("amount", 0),
+        "currency":        value.get("currency", "UAH"),
+        "status":          status,
         "datePublished":   get_tender_date(data),
         "region":          addr.get("region", ""),
         "locality":        addr.get("locality", ""),
-        "cpv":             items[0].get("classification", {}).get("id", "") if items else "",
-        "cpvDescription":  items[0].get("classification", {}).get("description", "") if items else "",
+        "cpv":             clf.get("id", ""),
+        "cpvDescription":  clf.get("description", ""),
         "url":             prozorro_url,
     }
 
@@ -575,7 +582,7 @@ async def get_tender_by_id(tender_id: str):
     is_ua_id = bool(re.match(r'^UA-\d{4}-\d{2}-\d{2}-', tender_id))
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0 ProzorroHunter/1.0"}) as client:
 
             # Спроба 1: прямий запит (працює тільки для внутрішніх hex-ID)
             if not is_ua_id:
