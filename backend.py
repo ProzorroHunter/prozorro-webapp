@@ -27,8 +27,9 @@ app.add_middleware(
 )
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-_search_lock = asyncio.Lock()
-_searching_filters: set[int] = set()  # фільтри що зараз шукають
+_search_lock     = asyncio.Lock()
+_active_searches: set = set()   # filter IDs зараз в пошуку
+_queued_searches: set = set()   # filter IDs в черзі (чекають lock)
 
 # DATABASE_URL — рядок підключення PostgreSQL (для Render/Neon).
 # Якщо не задано — використовується локальний SQLite файл.
@@ -138,10 +139,38 @@ class FilterCreate(BaseModel):
 PROZORRO_API = "https://public-api.prozorro.gov.ua/api/2.5"
 
 
+# ── Простий стемер для українських слів ─────────────────────────────────────
+# Дозволяє знаходити "ноутбук" при запиті "ноутбуки" і навпаки.
+_UK_SUFFIXES = tuple(sorted([
+    'ськими', 'зьких', 'зьким', 'ськими', 'ському', 'ській',
+    'ними', 'ому', 'ами', 'ями', 'ків', 'ань', 'ими',
+    'ого', 'ій', 'им', 'ої', 'ів', 'ях', 'ям', 'ою', 'ею', 'ую',
+    'ам', 'ах', 'ий', 'их', 'їх',
+    'и', 'а', 'у', 'і', 'е', 'є', 'ю', 'я', 'ь',
+], key=len, reverse=True))
+
+
+def uk_stem(word: str) -> str:
+    """Видаляє типове українське закінчення → нормалізований корінь."""
+    for suffix in _UK_SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[:-len(suffix)]
+    return word
+
+
 def make_kw_list(keywords: Optional[str]):
     if not keywords:
         return []
-    return [k.strip().lower() for k in keywords.split(",") if k.strip()]
+    result = []
+    for k in keywords.split(","):
+        k = k.strip().lower()
+        if not k:
+            continue
+        result.append(k)
+        stem = uk_stem(k)
+        if stem != k:          # додаємо корінь для відмінкових форм
+            result.append(stem)
+    return list(dict.fromkeys(result))  # унікальні, зберігаємо порядок
 
 
 def kw_in_text(kw: str, text: str) -> bool:
@@ -510,8 +539,30 @@ async def health():
     return {"status": "ok"}
 
 
+def _build_tender_response(tender_id: str, data: dict, prozorro_url: str, limited: bool = False) -> dict:
+    items = data.get("items", [])
+    addr  = data.get("procuringEntity", {}).get("address", {})
+    return {
+        "id":              tender_id,
+        "limited":         limited,
+        "newTender":       False,
+        "title":           data.get("title", ""),
+        "procuringEntity": data.get("procuringEntity", {}).get("name", ""),
+        "amount":          data.get("value", {}).get("amount", 0),
+        "currency":        data.get("value", {}).get("currency", "UAH"),
+        "status":          data.get("status", ""),
+        "datePublished":   get_tender_date(data),
+        "region":          addr.get("region", ""),
+        "locality":        addr.get("locality", ""),
+        "cpv":             items[0].get("classification", {}).get("id", "") if items else "",
+        "cpvDescription":  items[0].get("classification", {}).get("description", "") if items else "",
+        "url":             prozorro_url,
+    }
+
+
 @app.get("/api/tender/{tender_id}")
 async def get_tender_by_id(tender_id: str):
+    import re
     log(f"\n🔍 ПОШУК ТЕНДЕРА: {tender_id}")
     prozorro_url = f"https://prozorro.gov.ua/tender/{tender_id}"
     fallback = {
@@ -521,46 +572,81 @@ async def get_tender_by_id(tender_id: str):
         "datePublished": "", "region": "", "locality": "",
         "cpv": "", "cpvDescription": "", "url": prozorro_url,
     }
+    is_ua_id = bool(re.match(r'^UA-\d{4}-\d{2}-\d{2}-', tender_id))
+
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            r1 = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
-            log(f"   Спроба 1 → {r1.status_code}")
-            if r1.status_code == 200:
-                data  = r1.json().get("data", {})
-                items = data.get("items", [])
-                return {
-                    "id": tender_id, "limited": False, "newTender": False,
-                    "title":          data.get("title", ""),
-                    "procuringEntity":data.get("procuringEntity", {}).get("name", ""),
-                    "amount":         data.get("value", {}).get("amount", 0),
-                    "currency":       data.get("value", {}).get("currency", "UAH"),
-                    "status":         data.get("status", ""),
-                    "datePublished":  get_tender_date(data),
-                    "region":         data.get("procuringEntity", {}).get("address", {}).get("region", ""),
-                    "locality":       data.get("procuringEntity", {}).get("address", {}).get("locality", ""),
-                    "cpv":            items[0].get("classification", {}).get("id", "") if items else "",
-                    "cpvDescription": items[0].get("classification", {}).get("description", "") if items else "",
-                    "url":            prozorro_url,
+
+            # Спроба 1: прямий запит (працює тільки для внутрішніх hex-ID)
+            if not is_ua_id:
+                r1 = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
+                log(f"   Спроба 1 (hex) → {r1.status_code}")
+                if r1.status_code == 200:
+                    data = r1.json().get("data", {})
+                    return _build_tender_response(tender_id, data, prozorro_url)
+
+            # Спроба 2: пошук по tenderID в списку (UA-YYYY-MM-DD-...)
+            # Визначаємо дату тендера з номера — зупиняємось на 3 дні раніше
+            date_match = re.match(r'^UA-(\d{4}-\d{2}-\d{2})-', tender_id)
+            cutoff = None
+            if date_match:
+                tender_dt = datetime.fromisoformat(date_match.group(1))
+                cutoff    = (tender_dt - timedelta(days=3)).isoformat()
+                log(f"   Дата з номера: {date_match.group(1)}, зупинка на: {cutoff[:10]}")
+
+            log(f"   Шукаю по tenderID у списку (до 200 сторінок)...")
+            offset = None
+            for page in range(200):
+                params = {
+                    "opt_fields": "id,tenderID,title,status,dateModified",
+                    "descending": "1",
+                    "limit":      "100",
                 }
-            r2 = await client.get(f"{PROZORRO_API}/tenders",
-                                   params={"id": tender_id, "limit": 1})
-            if r2.status_code == 200:
-                lst = r2.json().get("data", [])
-                if lst:
-                    t = lst[0]
-                    return {**fallback, "limited": True, "newTender": False,
-                            "title": t.get("title", ""), "status": t.get("status", "unknown"),
-                            "datePublished": get_tender_date(t)}
-            r3 = await client.get(f"{PROZORRO_API}/tenders",
-                                   params={"descending": "1", "limit": "50",
-                                           "opt_fields": "id,title,status,dateModified"})
-            if r3.status_code == 200:
-                for t in r3.json().get("data", []):
-                    if t.get("id") == tender_id:
-                        return {**fallback, "limited": True, "newTender": False,
-                                "title": t.get("title", ""), "status": t.get("status", "unknown")}
-            fallback["newTender"] = True
-            return fallback
+                if offset:
+                    params["offset"] = offset
+
+                r = await client.get(f"{PROZORRO_API}/tenders", params=params)
+                if r.status_code != 200:
+                    break
+
+                body  = r.json()
+                items = body.get("data", [])
+
+                # На першій сторінці — дивимось що реально повертає API
+                if page == 0 and items:
+                    sample = items[0]
+                    log(f"   DEBUG fields: {list(sample.keys())}")
+                    log(f"   DEBUG item[0]: tenderID={sample.get('tenderID','N/A')} id={sample.get('id','N/A')[:20]}")
+                else:
+                    log(f"   Стор.{page+1}: {len(items)} | last={items[-1].get('dateModified','?')[:10] if items else '?'}")
+
+                for item in items:
+                    if item.get("tenderID") == tender_id or item.get("id") == tender_id:
+                        internal_id = item["id"]
+                        log(f"   ✅ Знайдено! internal_id={internal_id}")
+                        rd = await client.get(f"{PROZORRO_API}/tenders/{internal_id}")
+                        if rd.status_code == 200:
+                            data = rd.json().get("data", {})
+                            return _build_tender_response(tender_id, data, prozorro_url)
+                        return {**fallback, "limited": True,
+                                "title":         item.get("title", ""),
+                                "status":        item.get("status", "unknown"),
+                                "datePublished": get_tender_date(item)}
+
+                # Зупиняємось якщо пройшли дату тендера
+                if cutoff and items:
+                    last_date = items[-1].get("dateModified", "")
+                    if last_date and last_date < cutoff:
+                        log(f"   ⏹ Пройшли дату тендера ({last_date[:10]} < {cutoff[:10]})")
+                        break
+
+                offset = body.get("next_page", {}).get("offset")
+                if not offset:
+                    break
+
+            # Тендер не знайдено через API — але URL prozorro.gov.ua може працювати
+            log(f"   ⚠️ Не знайдено через API, повертаємо посилання на Prozorro")
+            return {**fallback, "limited": True, "newTender": False}
     except Exception as e:
         log(f"❌ EXCEPTION get_tender: {type(e).__name__}: {e}")
         return fallback
@@ -580,6 +666,26 @@ async def get_filters():
              "minAmount": r[7], "maxAmount": r[8], "periodDays": r[9],
              "isActive": bool(r[10]), "foundCount": r[11]}
             for r in rows]
+
+
+@app.put("/api/filters/{filter_id}")
+async def update_filter(filter_id: int, filter_data: FilterCreate, background_tasks: BackgroundTasks):
+    conn = sqlite3.connect('prozorro.db')
+    c = conn.cursor()
+    c.execute(
+        '''UPDATE filters SET name=?, keywords=?, cpv=?, region=?, procuring_entity=?,
+           supplier=?, min_amount=?, max_amount=?, period_days=?
+           WHERE id=? AND is_active=1''',
+        (filter_data.name, filter_data.keywords, filter_data.cpv,
+         filter_data.region, filter_data.procuringEntity, filter_data.supplier,
+         filter_data.minAmount, filter_data.maxAmount, filter_data.periodDays,
+         filter_id)
+    )
+    conn.commit()
+    conn.close()
+    log(f"\n✏️ Оновлено фільтр #{filter_id}: {filter_data.name}\n")
+    background_tasks.add_task(check_filter_task, filter_id)
+    return {"id": filter_id, "message": "Фільтр оновлено"}
 
 
 @app.post("/api/filters")
@@ -695,43 +801,44 @@ async def get_stats():
     return {"total": total, "today": today_count, "active": active_filters}
 
 
-async def check_filter_task(filter_id: int):
-    log(f"⏳ Фільтр #{filter_id}: очікую черги...")
-    _searching_filters.add(filter_id)
-    try:
-        async with _search_lock:
-            log(f"🔒 Фільтр #{filter_id}: починаю")
-            try:
-                conn = get_conn()
-                c = conn.cursor()
-                c.execute(
-                    f'''SELECT keywords, cpv, region, procuring_entity, supplier,
-                              min_amount, max_amount, period_days
-                       FROM filters WHERE id = {P} AND is_active = TRUE''',
-                    (filter_id,))
-                fd = c.fetchone()
-                conn.close()
-
-                if not fd:
-                    log(f"⚠️ Фільтр #{filter_id} не знайдено")
-                    return
-
-                saved = await search_and_save(
-                    filter_id,
-                    fd[0], fd[1], fd[2], fd[3], fd[4], fd[5], fd[6], fd[7] or 30
-                )
-                log(f"🏁 Фільтр #{filter_id}: завершено, збережено {saved} тендерів")
-
-            except Exception as e:
-                log(f"❌ ПОМИЛКА check_filter_task #{filter_id}: {e}")
-                log(traceback.format_exc())
-    finally:
-        _searching_filters.discard(filter_id)
-
-
 @app.get("/api/filters/{filter_id}/searching")
-async def filter_is_searching(filter_id: int):
-    return {"searching": filter_id in _searching_filters}
+async def is_filter_searching(filter_id: int):
+    return {"searching": filter_id in _active_searches or filter_id in _queued_searches}
+
+
+async def check_filter_task(filter_id: int):
+    _queued_searches.add(filter_id)
+    log(f"⏳ Фільтр #{filter_id}: очікую черги...")
+    async with _search_lock:
+        _queued_searches.discard(filter_id)
+        _active_searches.add(filter_id)
+        log(f"🔒 Фільтр #{filter_id}: починаю")
+        try:
+            conn = get_conn()
+            c = conn.cursor()
+            c.execute(
+                f'''SELECT keywords, cpv, region, procuring_entity, supplier,
+                          min_amount, max_amount, period_days
+                   FROM filters WHERE id = {P} AND is_active = TRUE''',
+                (filter_id,))
+            fd = c.fetchone()
+            conn.close()
+
+            if not fd:
+                log(f"⚠️ Фільтр #{filter_id} не знайдено")
+                return
+
+            saved = await search_and_save(
+                filter_id,
+                fd[0], fd[1], fd[2], fd[3], fd[4], fd[5], fd[6], fd[7] or 30
+            )
+            log(f"🏁 Фільтр #{filter_id}: завершено, збережено {saved} тендерів")
+
+        except Exception as e:
+            log(f"❌ ПОМИЛКА check_filter_task #{filter_id}: {e}")
+            log(traceback.format_exc())
+        finally:
+            _active_searches.discard(filter_id)
 
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
