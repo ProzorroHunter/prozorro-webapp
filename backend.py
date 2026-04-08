@@ -28,6 +28,7 @@ app.add_middleware(
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 _search_lock = asyncio.Lock()
+_searching_filters: set[int] = set()  # фільтри що зараз шукають
 
 # DATABASE_URL — рядок підключення PostgreSQL (для Render/Neon).
 # Якщо не задано — використовується локальний SQLite файл.
@@ -696,32 +697,41 @@ async def get_stats():
 
 async def check_filter_task(filter_id: int):
     log(f"⏳ Фільтр #{filter_id}: очікую черги...")
-    async with _search_lock:
-        log(f"🔒 Фільтр #{filter_id}: починаю")
-        try:
-            conn = get_conn()
-            c = conn.cursor()
-            c.execute(
-                f'''SELECT keywords, cpv, region, procuring_entity, supplier,
-                          min_amount, max_amount, period_days
-                   FROM filters WHERE id = {P} AND is_active = TRUE''',
-                (filter_id,))
-            fd = c.fetchone()
-            conn.close()
+    _searching_filters.add(filter_id)
+    try:
+        async with _search_lock:
+            log(f"🔒 Фільтр #{filter_id}: починаю")
+            try:
+                conn = get_conn()
+                c = conn.cursor()
+                c.execute(
+                    f'''SELECT keywords, cpv, region, procuring_entity, supplier,
+                              min_amount, max_amount, period_days
+                       FROM filters WHERE id = {P} AND is_active = TRUE''',
+                    (filter_id,))
+                fd = c.fetchone()
+                conn.close()
 
-            if not fd:
-                log(f"⚠️ Фільтр #{filter_id} не знайдено")
-                return
+                if not fd:
+                    log(f"⚠️ Фільтр #{filter_id} не знайдено")
+                    return
 
-            saved = await search_and_save(
-                filter_id,
-                fd[0], fd[1], fd[2], fd[3], fd[4], fd[5], fd[6], fd[7] or 30
-            )
-            log(f"🏁 Фільтр #{filter_id}: завершено, збережено {saved} тендерів")
+                saved = await search_and_save(
+                    filter_id,
+                    fd[0], fd[1], fd[2], fd[3], fd[4], fd[5], fd[6], fd[7] or 30
+                )
+                log(f"🏁 Фільтр #{filter_id}: завершено, збережено {saved} тендерів")
 
-        except Exception as e:
-            log(f"❌ ПОМИЛКА check_filter_task #{filter_id}: {e}")
-            log(traceback.format_exc())
+            except Exception as e:
+                log(f"❌ ПОМИЛКА check_filter_task #{filter_id}: {e}")
+                log(traceback.format_exc())
+    finally:
+        _searching_filters.discard(filter_id)
+
+
+@app.get("/api/filters/{filter_id}/searching")
+async def filter_is_searching(filter_id: int):
+    return {"searching": filter_id in _searching_filters}
 
 
 app.mount("/static", StaticFiles(directory="static"), name="static")

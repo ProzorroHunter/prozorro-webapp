@@ -492,6 +492,18 @@
 
         .empty-state .empty-icon { font-size: 2.5rem; margin-bottom: 10px; }
 
+        .searching-badge {
+            font-size: 0.75rem;
+            font-weight: 500;
+            color: #fbbf24;
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
         a { color: #6366f1; text-decoration: none; transition: color 0.2s; }
         a:hover { color: #a5b4fc; }
 
@@ -756,10 +768,11 @@
 
 <script>
 // ─── Global state ────────────────────────────────────
-let allFilters  = [];
-let allTenders  = [];
-let currentTab  = 'all';       // 'all' | filter_id (number)
-let deleteFilterId = null;
+let allFilters      = [];
+let allTenders      = [];
+let currentTab      = 'all';       // 'all' | filter_id (number)
+let deleteFilterId  = null;
+let searchingFilters = new Set();  // filter IDs currently searching
 
 // ─── Load ─────────────────────────────────────────────
 
@@ -767,9 +780,27 @@ async function loadData() {
     await loadStats();
     await loadFiltersData();
     await loadTendersData();
+    await pollSearchingStatus();
     renderFilters();
     renderTabs();
     renderTendersTable();
+}
+
+async function pollSearchingStatus() {
+    if (allFilters.length === 0) return;
+    const results = await Promise.allSettled(
+        allFilters.map(f =>
+            fetch(`/api/filters/${f.id}/searching`)
+                .then(r => r.json())
+                .then(d => ({ id: f.id, searching: d.searching }))
+        )
+    );
+    searchingFilters.clear();
+    results.forEach(r => {
+        if (r.status === 'fulfilled' && r.value.searching) {
+            searchingFilters.add(r.value.id);
+        }
+    });
 }
 
 async function loadStats() {
@@ -811,10 +842,11 @@ function renderFilters() {
     grid.innerHTML = allFilters.map(f => {
         const count = allTenders.filter(t => t.filterId === f.id).length;
         const isSelected = currentTab === f.id;
+        const isSearching = searchingFilters.has(f.id);
         return `
         <div class="filter-card glass ${isSelected ? 'selected' : ''}" onclick="switchTab(${f.id})">
             <div class="filter-delete" onclick="event.stopPropagation(); askDeleteFilter(${f.id}, '${escHtml(f.name)}')" title="Видалити фільтр">×</div>
-            <h3>${escHtml(f.name)}</h3>
+            <h3>${escHtml(f.name)} ${isSearching ? '<span class="searching-badge">🔍 Шукає...</span>' : ''}</h3>
             ${f.keywords       ? `<div class="filter-tag">🔑 ${escHtml(f.keywords)}</div>` : ''}
             ${f.cpv            ? `<div class="filter-tag">📦 CPV: ${escHtml(f.cpv)}</div>` : ''}
             ${f.region         ? `<div class="filter-tag">📍 ${escHtml(f.region)}</div>` : ''}
@@ -1003,11 +1035,28 @@ async function searchNow(filterId) {
     showNotification('🔍 Запускаю пошук...', 'info');
     try {
         await fetch(`/api/filters/${filterId}/search`, { method: 'POST' });
-        showNotification('✅ Пошук запущено! Оновлю через 8 сек...');
-        setTimeout(() => loadData(), 8000);
+        showNotification('✅ Пошук запущено!');
+        searchingFilters.add(filterId);
+        renderFilters();
+        startSearchPolling();
     } catch (e) {
         showNotification('⏳ Пошук запущено у фоні', 'info');
     }
+}
+
+let _searchPollInterval = null;
+
+function startSearchPolling() {
+    if (_searchPollInterval) return;
+    _searchPollInterval = setInterval(async () => {
+        await pollSearchingStatus();
+        renderFilters();
+        if (searchingFilters.size === 0) {
+            clearInterval(_searchPollInterval);
+            _searchPollInterval = null;
+            await loadData(); // фінальне оновлення після завершення
+        }
+    }, 3000);
 }
 
 function askDeleteFilter(id, name) {
