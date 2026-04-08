@@ -1026,11 +1026,6 @@ async function searchByTenderId() {
             showNotification('❌ Тендер не знайдено. Перевірте номер.', 'error');
             return;
         }
-        if (data.limited && !data.title) {
-            showNotification('🔗 Відкриваємо тендер на Prozorro.gov.ua...', 'info');
-            window.open(data.url, '_blank');
-            return;
-        }
         showTenderModal(data);
     } catch (e) {
         showNotification('🔗 Відкриваємо тендер на Prozorro.gov.ua...', 'info');
