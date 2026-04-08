@@ -628,7 +628,7 @@ async def get_tender_by_id(tender_id: str):
                 return {}
 
             offset = tender_date + "T00:00:00"
-            for page in range(100):  # до 10 000 тендерів
+            for page in range(10):  # до 1000 тендерів (Render timeout ~30s)
                 r = await client.get(f"{PROZORRO_API}/tenders", params={
                     "opt_fields": "id,dateModified",
                     "limit":      "100",

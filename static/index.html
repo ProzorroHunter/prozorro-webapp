@@ -1033,7 +1033,8 @@ async function searchByTenderId() {
         }
         showTenderModal(data);
     } catch (e) {
-        showNotification('❌ Помилка пошуку', 'error');
+        showNotification('🔗 Відкриваємо тендер на Prozorro.gov.ua...', 'info');
+        window.open(`https://prozorro.gov.ua/tender/${encodeURIComponent(tenderId)}`, '_blank');
         console.error(e);
     }
 }
