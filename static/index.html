@@ -1040,44 +1040,19 @@ function showTenderModal(data) {
     document.getElementById('tenderModalLink').href         = data.url;
 
     const statusMap = {
-        'active':                 ['✅ Активний',              'status-active'],
-        'active.tendering':       ['📋 Прийом пропозицій',     'status-active'],
-        'active.enquiries':       ['💬 Уточнення умов',         'status-active'],
-        'active.pre-qualification':['🔍 Попередня кваліфікація','status-active'],
-        'active.qualification':   ['🔍 Кваліфікація',           'status-active'],
-        'active.awarded':         ['🏆 Визначено переможця',    'status-active'],
-        'active.auction':         ['⚡ Аукціон',                'status-active'],
-        'complete':               ['🏁 Завершений',             'status-complete'],
-        'cancelled':              ['❌ Скасований',             'status-cancelled'],
-        'unsuccessful':           ['⚠️ Не відбувся',           'status-unsuccessful'],
-        'draft':                  ['📝 Чернетка',               'status-unknown'],
-        'unknown':                ['❓ Невідомо',               'status-unknown'],
+        active:       ['✅ Активний',      'status-active'],
+        complete:     ['🏁 Завершений',    'status-complete'],
+        cancelled:    ['❌ Скасований',    'status-cancelled'],
+        unsuccessful: ['⚠️ Не відбувся',  'status-unsuccessful'],
+        unknown:      ['❓ Невідомо',      'status-unknown'],
     };
-    const [statusLabel, statusClass] = statusMap[data.status] || statusMap['unknown'];
+    const [statusLabel, statusClass] = statusMap[data.status] || statusMap.unknown;
 
     const grid = document.getElementById('tenderInfoGrid');
-
-    // Якщо API не повернув дані — показуємо попередження
-    const noData = data.newTender || (!data.title && !data.procuringEntity && !data.amount);
-    const limitedBanner = data.limited && !data.newTender
-        ? `<div class="tender-info-item" style="grid-column:1/-1;background:rgba(245,158,11,0.08);border-color:rgba(245,158,11,0.25);">
-               <div class="tender-info-label" style="color:#fbbf24;">⚠️ Обмежені дані</div>
-               <div class="tender-info-value" style="font-size:.85rem;color:rgba(255,255,255,.6);">API повернув неповну інформацію. Перейдіть на Prozorro для деталей.</div>
-           </div>`
-        : '';
-    const notFoundBanner = noData
-        ? `<div class="tender-info-item" style="grid-column:1/-1;background:rgba(239,68,68,0.08);border-color:rgba(239,68,68,0.25);">
-               <div class="tender-info-label" style="color:#f87171;">ℹ️ Дані недоступні через API</div>
-               <div class="tender-info-value" style="font-size:.85rem;color:rgba(255,255,255,.6);">Тендер може існувати — перевірте за посиланням нижче.</div>
-           </div>`
-        : '';
-
     grid.innerHTML = `
-        ${limitedBanner}${notFoundBanner}
         <div class="tender-info-item" style="grid-column:1/-1;">
             <div class="tender-info-label">Статус</div>
             <span class="status-badge ${statusClass}">${statusLabel}</span>
-            ${data.status && !statusMap[data.status] ? `<small style="color:rgba(255,255,255,.4);margin-left:8px;">(${escHtml(data.status)})</small>` : ''}
         </div>
         <div class="tender-info-item" style="grid-column:1/-1;">
             <div class="tender-info-label">Замовник</div>
@@ -1399,3 +1374,4 @@ loadData();
 </script>
 </body>
 </html>
+
