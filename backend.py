@@ -672,12 +672,12 @@ async def get_filters():
 
 @app.put("/api/filters/{filter_id}")
 async def update_filter(filter_id: int, filter_data: FilterCreate, background_tasks: BackgroundTasks):
-    conn = sqlite3.connect('prozorro.db')
+    conn = get_conn()
     c = conn.cursor()
     c.execute(
-        '''UPDATE filters SET name=?, keywords=?, cpv=?, region=?, procuring_entity=?,
-           supplier=?, min_amount=?, max_amount=?, period_days=?
-           WHERE id=? AND is_active=1''',
+        f'''UPDATE filters SET name={P}, keywords={P}, cpv={P}, region={P}, procuring_entity={P},
+           supplier={P}, min_amount={P}, max_amount={P}, period_days={P}
+           WHERE id={P} AND is_active = TRUE''',
         (filter_data.name, filter_data.keywords, filter_data.cpv,
          filter_data.region, filter_data.procuringEntity, filter_data.supplier,
          filter_data.minAmount, filter_data.maxAmount, filter_data.periodDays,
