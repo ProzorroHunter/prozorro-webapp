@@ -11,6 +11,11 @@ import sqlite3
 import os
 import traceback
 
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
+
 app = FastAPI(title="ProzorroHunter API")
 
 app.add_middleware(
@@ -24,8 +29,22 @@ app.add_middleware(
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 _search_lock = asyncio.Lock()
 
-# DB_PATH: на Render підключи Persistent Disk і постав DB_PATH=/data/prozorro.db
+# DATABASE_URL — рядок підключення PostgreSQL (для Render/Neon).
+# Якщо не задано — використовується локальний SQLite файл.
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 DB_PATH = os.getenv("DB_PATH", "prozorro.db")
+USE_PG = bool(DATABASE_URL and psycopg2)
+
+# Плейсхолдер параметрів: %s для PostgreSQL, ? для SQLite
+P = "%s" if USE_PG else "?"
+
+
+def get_conn():
+    if USE_PG:
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.autocommit = False
+        return conn
+    return sqlite3.connect(DB_PATH, timeout=10)
 
 
 def log(*args):
@@ -33,12 +52,11 @@ def log(*args):
 
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filters'")
-    if not c.fetchone():
-        c.execute('''CREATE TABLE filters (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+    if USE_PG:
+        c.execute('''CREATE TABLE IF NOT EXISTS filters (
+            id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
             keywords TEXT,
             cpv TEXT,
@@ -48,11 +66,11 @@ def init_db():
             min_amount REAL,
             max_amount REAL,
             period_days INTEGER DEFAULT 30,
-            is_active BOOLEAN DEFAULT 1,
+            is_active BOOLEAN DEFAULT TRUE,
             found_count INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
-        c.execute('''CREATE TABLE tenders (
+        c.execute('''CREATE TABLE IF NOT EXISTS tenders (
             id TEXT PRIMARY KEY,
             title TEXT,
             procuring_entity TEXT,
@@ -62,12 +80,41 @@ def init_db():
             date_published TIMESTAMP,
             url TEXT,
             filter_id INTEGER,
-            notified BOOLEAN DEFAULT 0,
+            notified BOOLEAN DEFAULT FALSE,
             FOREIGN KEY (filter_id) REFERENCES filters(id)
         )''')
-        log("✅ Таблиці створено")
     else:
-        log("✅ Таблиці існують")
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filters'")
+        if not c.fetchone():
+            c.execute('''CREATE TABLE filters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                keywords TEXT,
+                cpv TEXT,
+                region TEXT,
+                procuring_entity TEXT,
+                supplier TEXT,
+                min_amount REAL,
+                max_amount REAL,
+                period_days INTEGER DEFAULT 30,
+                is_active BOOLEAN DEFAULT 1,
+                found_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )''')
+            c.execute('''CREATE TABLE tenders (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                procuring_entity TEXT,
+                amount REAL,
+                cpv TEXT,
+                region TEXT,
+                date_published TIMESTAMP,
+                url TEXT,
+                filter_id INTEGER,
+                notified BOOLEAN DEFAULT 0,
+                FOREIGN KEY (filter_id) REFERENCES filters(id)
+            )''')
+    log("✅ БД ініціалізовано" + (" (PostgreSQL)" if USE_PG else " (SQLite)"))
     conn.commit()
     conn.close()
 
@@ -213,17 +260,18 @@ def get_tender_date(dd: dict) -> str:
 def save_tender_now(filter_id: int, tender: dict) -> bool:
     """Зберігає тендер в БД одразу. Повертає True якщо новий."""
     try:
-        conn = sqlite3.connect(DB_PATH, timeout=10)
+        conn = get_conn()
         c = conn.cursor()
-        c.execute('SELECT id FROM tenders WHERE id = ?', (tender["id"],))
+        c.execute(f'SELECT id FROM tenders WHERE id = {P}', (tender["id"],))
         if c.fetchone():
             conn.close()
             return False
         c.execute(
-            '''INSERT OR IGNORE INTO tenders
+            f'''INSERT INTO tenders
                (id, title, procuring_entity, amount, cpv, region,
                 date_published, url, filter_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+               VALUES ({P},{P},{P},{P},{P},{P},{P},{P},{P})
+               ON CONFLICT (id) DO NOTHING''',
             (tender["id"], tender["title"], tender["procuringEntity"],
              tender["amount"], tender["cpv"], tender["region"],
              tender["datePublished"], tender["url"], filter_id)
@@ -231,7 +279,7 @@ def save_tender_now(filter_id: int, tender: dict) -> bool:
         saved = c.rowcount > 0
         if saved:
             c.execute(
-                'UPDATE filters SET found_count = found_count + 1 WHERE id = ?',
+                f'UPDATE filters SET found_count = found_count + 1 WHERE id = {P}',
                 (filter_id,)
             )
         conn.commit()
@@ -519,11 +567,11 @@ async def get_tender_by_id(tender_id: str):
 
 @app.get("/api/filters")
 async def get_filters():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute('''SELECT id, name, keywords, cpv, region, procuring_entity, supplier,
                  min_amount, max_amount, period_days, is_active, found_count
-                 FROM filters WHERE is_active = 1 ORDER BY id''')
+                 FROM filters WHERE is_active = TRUE ORDER BY id''')
     rows = c.fetchall()
     conn.close()
     return [{"id": r[0], "name": r[1], "keywords": r[2], "cpv": r[3],
@@ -535,17 +583,28 @@ async def get_filters():
 
 @app.post("/api/filters")
 async def create_filter(filter_data: FilterCreate, background_tasks: BackgroundTasks):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute(
-        '''INSERT INTO filters (name, keywords, cpv, region, procuring_entity, supplier,
-                                min_amount, max_amount, period_days)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-        (filter_data.name, filter_data.keywords, filter_data.cpv,
-         filter_data.region, filter_data.procuringEntity, filter_data.supplier,
-         filter_data.minAmount, filter_data.maxAmount, filter_data.periodDays)
-    )
-    filter_id = c.lastrowid
+    if USE_PG:
+        c.execute(
+            f'''INSERT INTO filters (name, keywords, cpv, region, procuring_entity, supplier,
+                                    min_amount, max_amount, period_days)
+               VALUES ({P},{P},{P},{P},{P},{P},{P},{P},{P}) RETURNING id''',
+            (filter_data.name, filter_data.keywords, filter_data.cpv,
+             filter_data.region, filter_data.procuringEntity, filter_data.supplier,
+             filter_data.minAmount, filter_data.maxAmount, filter_data.periodDays)
+        )
+        filter_id = c.fetchone()[0]
+    else:
+        c.execute(
+            f'''INSERT INTO filters (name, keywords, cpv, region, procuring_entity, supplier,
+                                    min_amount, max_amount, period_days)
+               VALUES ({P},{P},{P},{P},{P},{P},{P},{P},{P})''',
+            (filter_data.name, filter_data.keywords, filter_data.cpv,
+             filter_data.region, filter_data.procuringEntity, filter_data.supplier,
+             filter_data.minAmount, filter_data.maxAmount, filter_data.periodDays)
+        )
+        filter_id = c.lastrowid
     conn.commit()
     conn.close()
     log(f"\n✅ Створено фільтр #{filter_id}: {filter_data.name}\n")
@@ -562,9 +621,9 @@ async def search_filter_now(filter_id: int, background_tasks: BackgroundTasks):
 
 @app.delete("/api/filters/{filter_id}")
 async def delete_filter(filter_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute('UPDATE filters SET is_active = 0 WHERE id = ?', (filter_id,))
+    c.execute(f'UPDATE filters SET is_active = FALSE WHERE id = {P}', (filter_id,))
     conn.commit()
     conn.close()
     log(f"\n🗑️ Видалено фільтр #{filter_id}\n")
@@ -573,21 +632,21 @@ async def delete_filter(filter_id: int):
 
 @app.get("/api/tenders")
 async def get_tenders(limit: int = 200, filter_id: Optional[int] = None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     if filter_id:
         c.execute(
-            '''SELECT t.id, t.title, t.procuring_entity, t.amount, t.cpv, t.region,
+            f'''SELECT t.id, t.title, t.procuring_entity, t.amount, t.cpv, t.region,
                       t.date_published, t.url, t.filter_id, f.name
                FROM tenders t LEFT JOIN filters f ON t.filter_id = f.id
-               WHERE t.filter_id = ? ORDER BY t.date_published DESC LIMIT ?''',
+               WHERE t.filter_id = {P} ORDER BY t.date_published DESC LIMIT {P}''',
             (filter_id, limit))
     else:
         c.execute(
-            '''SELECT t.id, t.title, t.procuring_entity, t.amount, t.cpv, t.region,
+            f'''SELECT t.id, t.title, t.procuring_entity, t.amount, t.cpv, t.region,
                       t.date_published, t.url, t.filter_id, f.name
                FROM tenders t LEFT JOIN filters f ON t.filter_id = f.id
-               ORDER BY t.date_published DESC LIMIT ?''',
+               ORDER BY t.date_published DESC LIMIT {P}''',
             (limit,))
     rows = c.fetchall()
     conn.close()
@@ -600,7 +659,7 @@ async def get_tenders(limit: int = 200, filter_id: Optional[int] = None):
 
 @app.delete("/api/tenders/all")
 async def clear_all_tenders():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute('DELETE FROM tenders')
     c.execute('UPDATE filters SET found_count = 0')
@@ -611,10 +670,10 @@ async def clear_all_tenders():
 
 @app.delete("/api/tenders/filter/{filter_id}")
 async def clear_filter_tenders(filter_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute('DELETE FROM tenders WHERE filter_id = ?', (filter_id,))
-    c.execute('UPDATE filters SET found_count = 0 WHERE id = ?', (filter_id,))
+    c.execute(f'DELETE FROM tenders WHERE filter_id = {P}', (filter_id,))
+    c.execute(f'UPDATE filters SET found_count = 0 WHERE id = {P}', (filter_id,))
     conn.commit()
     conn.close()
     return {"message": f"Тендери фільтра #{filter_id} очищено"}
@@ -622,14 +681,14 @@ async def clear_filter_tenders(filter_id: int):
 
 @app.get("/api/stats")
 async def get_stats():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute('SELECT COUNT(*) FROM tenders')
     total = c.fetchone()[0]
     today = datetime.now().date().isoformat()
-    c.execute('SELECT COUNT(*) FROM tenders WHERE DATE(date_published) = ?', (today,))
+    c.execute(f'SELECT COUNT(*) FROM tenders WHERE DATE(date_published) = {P}', (today,))
     today_count = c.fetchone()[0]
-    c.execute('SELECT COUNT(*) FROM filters WHERE is_active = 1')
+    c.execute('SELECT COUNT(*) FROM filters WHERE is_active = TRUE')
     active_filters = c.fetchone()[0]
     conn.close()
     return {"total": total, "today": today_count, "active": active_filters}
@@ -640,12 +699,12 @@ async def check_filter_task(filter_id: int):
     async with _search_lock:
         log(f"🔒 Фільтр #{filter_id}: починаю")
         try:
-            conn = sqlite3.connect(DB_PATH)
+            conn = get_conn()
             c = conn.cursor()
             c.execute(
-                '''SELECT keywords, cpv, region, procuring_entity, supplier,
+                f'''SELECT keywords, cpv, region, procuring_entity, supplier,
                           min_amount, max_amount, period_days
-                   FROM filters WHERE id = ? AND is_active = 1''',
+                   FROM filters WHERE id = {P} AND is_active = TRUE''',
                 (filter_id,))
             fd = c.fetchone()
             conn.close()
