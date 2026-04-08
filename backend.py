@@ -26,13 +26,16 @@ _search_lock     = asyncio.Lock()
 _active_searches: set = set()   # filter IDs зараз в пошуку
 _queued_searches: set = set()   # filter IDs в черзі (чекають lock)
 
+# DB_PATH: на Render підключи Persistent Disk і постав DB_PATH=/data/prozorro.db
+DB_PATH = os.getenv("DB_PATH", "prozorro.db")
+
 
 def log(*args):
     print(*args, flush=True)
 
 
 def init_db():
-    conn = sqlite3.connect('prozorro.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filters'")
     if not c.fetchone():
@@ -121,6 +124,20 @@ def make_kw_list(keywords: Optional[str]):
         if stem != k:          # додаємо корінь для відмінкових форм
             result.append(stem)
     return list(dict.fromkeys(result))  # унікальні, зберігаємо порядок
+
+
+def kw_in_text(kw: str, text: str) -> bool:
+    """Перевірка з морфологічною толерантністю.
+    'ноутбуки' знайде 'ноутбук', 'комп'ютерів' знайде 'комп'ютер' і т.д.
+    Відрізає до 3 символів з кінця, залишаючи мінімум 4 символи стему.
+    """
+    if kw in text:
+        return True
+    for trim in range(1, 4):
+        if len(kw) - trim >= 4:
+            if kw[:-trim] in text:
+                return True
+    return False
 
 
 # ── Таблиця відповідності: область ↔ місто ───────────────────────────────────
@@ -226,7 +243,7 @@ def get_tender_date(dd: dict) -> str:
 def save_tender_now(filter_id: int, tender: dict) -> bool:
     """Зберігає тендер в БД одразу. Повертає True якщо новий."""
     try:
-        conn = sqlite3.connect('prozorro.db', timeout=10)
+        conn = sqlite3.connect(DB_PATH, timeout=10)
         c = conn.cursor()
         c.execute('SELECT id FROM tenders WHERE id = ?', (tender["id"],))
         if c.fetchone():
@@ -318,9 +335,10 @@ async def search_and_save(filter_id: int, keywords=None, cpv=None, region=None,
                         reached_boundary = True
                         break
 
-                    # Pre-filter по title
+                    # Pre-filter по title (з морфологічною толерантністю)
                     if list_title and kw_list:
-                        if not any(kw in list_title.lower() for kw in kw_list):
+                        lt_lower = list_title.lower()
+                        if not any(kw_in_text(kw, lt_lower) for kw in kw_list):
                             continue
 
                     # Detail-запит
@@ -406,7 +424,7 @@ def check_filter_detailed(tender, keywords, cpv, region, procuring_entity,
     if keywords:
         text    = (tender.get("title", "") + " " + tender.get("description", "")).lower()
         kw_list = make_kw_list(keywords)
-        if not any(kw in text for kw in kw_list):
+        if not any(kw_in_text(kw, text) for kw in kw_list):
             return {"matches": False,
                     "reason": f"Немає жодного з ключових слів '{keywords}' в тексті"}
 
@@ -428,8 +446,17 @@ def check_filter_detailed(tender, keywords, cpv, region, procuring_entity,
 
     if procuring_entity:
         entity = tender.get("procuringEntity", {}).get("name", "").lower()
-        if procuring_entity.lower() not in entity:
-            return {"matches": False, "reason": "Замовник не співпадає"}
+        # Пошук по кожному слову окремо (Prozorro зберігає назви у різних форматах:
+        # великі літери, різний порядок слів, скорочення тощо).
+        # Слова коротші за 3 символи ігноруємо (прийменники, артиклі).
+        search_words = [w for w in procuring_entity.lower().split() if len(w) >= 3]
+        if search_words and not all(kw_in_text(w, entity) for w in search_words):
+            return {"matches": False, "reason": f"Замовник не співпадає: шукали '{procuring_entity}', є '{entity[:80]}'"}
+        # Також перевіряємо identifier (ЄДРПОУ) якщо введено тільки цифри
+        if procuring_entity.strip().isdigit():
+            edrpou = tender.get("procuringEntity", {}).get("identifier", {}).get("id", "")
+            if procuring_entity.strip() not in edrpou:
+                return {"matches": False, "reason": f"ЄДРПОУ не співпадає"}
 
     if supplier:
         found = False
@@ -579,7 +606,7 @@ async def get_tender_by_id(tender_id: str):
 
 @app.get("/api/filters")
 async def get_filters():
-    conn = sqlite3.connect('prozorro.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''SELECT id, name, keywords, cpv, region, procuring_entity, supplier,
                  min_amount, max_amount, period_days, is_active, found_count
@@ -615,7 +642,7 @@ async def update_filter(filter_id: int, filter_data: FilterCreate, background_ta
 
 @app.post("/api/filters")
 async def create_filter(filter_data: FilterCreate, background_tasks: BackgroundTasks):
-    conn = sqlite3.connect('prozorro.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
         '''INSERT INTO filters (name, keywords, cpv, region, procuring_entity, supplier,
@@ -642,7 +669,7 @@ async def search_filter_now(filter_id: int, background_tasks: BackgroundTasks):
 
 @app.delete("/api/filters/{filter_id}")
 async def delete_filter(filter_id: int):
-    conn = sqlite3.connect('prozorro.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('UPDATE filters SET is_active = 0 WHERE id = ?', (filter_id,))
     conn.commit()
@@ -653,7 +680,7 @@ async def delete_filter(filter_id: int):
 
 @app.get("/api/tenders")
 async def get_tenders(limit: int = 200, filter_id: Optional[int] = None):
-    conn = sqlite3.connect('prozorro.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     if filter_id:
         c.execute(
@@ -680,7 +707,7 @@ async def get_tenders(limit: int = 200, filter_id: Optional[int] = None):
 
 @app.delete("/api/tenders/all")
 async def clear_all_tenders():
-    conn = sqlite3.connect('prozorro.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('DELETE FROM tenders')
     c.execute('UPDATE filters SET found_count = 0')
@@ -691,7 +718,7 @@ async def clear_all_tenders():
 
 @app.delete("/api/tenders/filter/{filter_id}")
 async def clear_filter_tenders(filter_id: int):
-    conn = sqlite3.connect('prozorro.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('DELETE FROM tenders WHERE filter_id = ?', (filter_id,))
     c.execute('UPDATE filters SET found_count = 0 WHERE id = ?', (filter_id,))
@@ -702,7 +729,7 @@ async def clear_filter_tenders(filter_id: int):
 
 @app.get("/api/stats")
 async def get_stats():
-    conn = sqlite3.connect('prozorro.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('SELECT COUNT(*) FROM tenders')
     total = c.fetchone()[0]
@@ -728,7 +755,7 @@ async def check_filter_task(filter_id: int):
         _active_searches.add(filter_id)
         log(f"🔒 Фільтр #{filter_id}: починаю")
         try:
-            conn = sqlite3.connect('prozorro.db')
+            conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
             c.execute(
                 '''SELECT keywords, cpv, region, procuring_entity, supplier,
