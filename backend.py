@@ -585,60 +585,72 @@ async def get_tender_by_id(tender_id: str):
                     data = r1.json().get("data", {})
                     return _build_tender_response(tender_id, data, prozorro_url)
 
-            # Спроба 2: ASCENDING пошук від дати тендера (UA-YYYY-MM-DD-...)
-            # Починаємо від дати публікації — 2000 тендерів достатньо щоб знайти
-            # (замість DESCENDING від найновіших де треба 20 000+ сторінок)
+            # Спроба 2: UA- ID безпосередньо в path (деякі версії API підтримують)
+            r2 = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
+            log(f"   Спроба 2 (UA path) → {r2.status_code}")
+            if r2.status_code == 200:
+                data = r2.json().get("data", {})
+                if data:
+                    return _build_tender_response(tender_id, data, prozorro_url)
+
+            # Спроба 3: ?tenderID= як параметр фільтру (якщо API підтримує)
+            r3 = await client.get(f"{PROZORRO_API}/tenders",
+                                  params={"tenderID": tender_id, "opt_fields": "id,tenderID", "limit": "3"})
+            log(f"   Спроба 3 (tenderID param) → {r3.status_code}")
+            if r3.status_code == 200:
+                for item in r3.json().get("data", []):
+                    if item.get("tenderID") == tender_id:
+                        rd = await client.get(f"{PROZORRO_API}/tenders/{item['id']}")
+                        if rd.status_code == 200:
+                            return _build_tender_response(tender_id, rd.json().get("data", {}), prozorro_url)
+
+            # Спроба 4: ASCENDING від дати тендера + detail fetch для кожного елементу
+            # (tenderID відсутній у list API — потрібен detail запит)
             date_match = re.match(r'^UA-(\d{4}-\d{2}-\d{2})-', tender_id)
             if not date_match:
-                log(f"   ⚠️ Не UA-формат і не hex-ID")
                 return {**fallback, "limited": True, "newTender": False}
 
             tender_date = date_match.group(1)
-            # Стартуємо ASCENDING з початку дня тендера
-            start_offset = tender_date + "T00:00:00"
-            # Зупиняємось якщо пройшли +3 дні від дати тендера
-            stop_after   = (datetime.fromisoformat(tender_date) + timedelta(days=3)).isoformat()
+            stop_after  = (datetime.fromisoformat(tender_date) + timedelta(days=3)).isoformat()
+            log(f"   Спроба 4: ascending+detail від {tender_date}...")
 
-            log(f"   Ascending від {tender_date}, зупинка після {stop_after[:10]}...")
+            sem = asyncio.Semaphore(15)  # 15 паралельних detail-запитів
 
-            offset = start_offset
-            for page in range(30):   # 30 × 100 = 3000 тендерів — більш ніж достатньо
-                params = {
-                    "opt_fields": "id,tenderID,title,status,dateModified",
+            async def fetch_detail(iid: str) -> dict:
+                async with sem:
+                    try:
+                        rd = await client.get(f"{PROZORRO_API}/tenders/{iid}", timeout=8.0)
+                        if rd.status_code == 200:
+                            return rd.json().get("data", {})
+                    except Exception:
+                        pass
+                return {}
+
+            offset = tender_date + "T00:00:00"
+            for page in range(40):
+                r = await client.get(f"{PROZORRO_API}/tenders", params={
+                    "opt_fields": "id,dateModified",
                     "limit":      "100",
                     "offset":     offset,
-                }
-                # БЕЗ descending — ascending від дати тендера
-
-                r = await client.get(f"{PROZORRO_API}/tenders", params=params)
+                })
                 if r.status_code != 200:
-                    log(f"   ⚠️ API {r.status_code} на стор.{page+1}")
                     break
-
                 body  = r.json()
                 items = body.get("data", [])
                 if not items:
                     break
 
                 last_date = items[-1].get("dateModified", "")
-                log(f"   Стор.{page+1}: {len(items)} | {items[0].get('dateModified','?')[:10]} → {last_date[:10]}")
+                log(f"   Стор.{page+1}: {len(items)} | {items[0].get('dateModified','?')[:10]}→{last_date[:10]} +detail")
 
-                for item in items:
-                    if item.get("tenderID") == tender_id or item.get("id") == tender_id:
-                        internal_id = item["id"]
-                        log(f"   ✅ Знайдено! internal_id={internal_id}")
-                        rd = await client.get(f"{PROZORRO_API}/tenders/{internal_id}")
-                        if rd.status_code == 200:
-                            data = rd.json().get("data", {})
-                            return _build_tender_response(tender_id, data, prozorro_url)
-                        return {**fallback, "limited": True,
-                                "title":         item.get("title", ""),
-                                "status":        item.get("status", "unknown"),
-                                "datePublished": get_tender_date(item)}
+                details = await asyncio.gather(*[fetch_detail(it["id"]) for it in items])
+                for detail in details:
+                    if detail.get("tenderID") == tender_id:
+                        log(f"   ✅ Знайдено через detail!")
+                        return _build_tender_response(tender_id, detail, prozorro_url)
 
-                # Зупиняємось якщо пройшли +3 дні
                 if last_date and last_date > stop_after:
-                    log(f"   ⏹ Пройшли +3 дні від дати тендера")
+                    log(f"   ⏹ Пройшли +3 дні")
                     break
 
                 offset = body.get("next_page", {}).get("offset")
