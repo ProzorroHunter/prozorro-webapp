@@ -11,6 +11,11 @@ import sqlite3
 import os
 import traceback
 
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
+
 app = FastAPI(title="ProzorroHunter API")
 
 app.add_middleware(
@@ -22,7 +27,26 @@ app.add_middleware(
 )
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-_search_lock = asyncio.Lock()
+_search_lock     = asyncio.Lock()
+_active_searches: set = set()   # filter IDs зараз в пошуку
+_queued_searches: set = set()   # filter IDs в черзі (чекають lock)
+
+# DATABASE_URL — рядок підключення PostgreSQL (для Render/Neon).
+# Якщо не задано — використовується локальний SQLite файл.
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+DB_PATH = os.getenv("DB_PATH", "prozorro.db")
+USE_PG = bool(DATABASE_URL and psycopg2)
+
+# Плейсхолдер параметрів: %s для PostgreSQL, ? для SQLite
+P = "%s" if USE_PG else "?"
+
+
+def get_conn():
+    if USE_PG:
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.autocommit = False
+        return conn
+    return sqlite3.connect(DB_PATH, timeout=10)
 
 
 def log(*args):
@@ -30,12 +54,11 @@ def log(*args):
 
 
 def init_db():
-    conn = sqlite3.connect('prozorro.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filters'")
-    if not c.fetchone():
-        c.execute('''CREATE TABLE filters (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+    if USE_PG:
+        c.execute('''CREATE TABLE IF NOT EXISTS filters (
+            id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
             keywords TEXT,
             cpv TEXT,
@@ -45,11 +68,11 @@ def init_db():
             min_amount REAL,
             max_amount REAL,
             period_days INTEGER DEFAULT 30,
-            is_active BOOLEAN DEFAULT 1,
+            is_active BOOLEAN DEFAULT TRUE,
             found_count INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
-        c.execute('''CREATE TABLE tenders (
+        c.execute('''CREATE TABLE IF NOT EXISTS tenders (
             id TEXT PRIMARY KEY,
             title TEXT,
             procuring_entity TEXT,
@@ -59,12 +82,41 @@ def init_db():
             date_published TIMESTAMP,
             url TEXT,
             filter_id INTEGER,
-            notified BOOLEAN DEFAULT 0,
+            notified BOOLEAN DEFAULT FALSE,
             FOREIGN KEY (filter_id) REFERENCES filters(id)
         )''')
-        log("✅ Таблиці створено")
     else:
-        log("✅ Таблиці існують")
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filters'")
+        if not c.fetchone():
+            c.execute('''CREATE TABLE filters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                keywords TEXT,
+                cpv TEXT,
+                region TEXT,
+                procuring_entity TEXT,
+                supplier TEXT,
+                min_amount REAL,
+                max_amount REAL,
+                period_days INTEGER DEFAULT 30,
+                is_active BOOLEAN DEFAULT 1,
+                found_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )''')
+            c.execute('''CREATE TABLE tenders (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                procuring_entity TEXT,
+                amount REAL,
+                cpv TEXT,
+                region TEXT,
+                date_published TIMESTAMP,
+                url TEXT,
+                filter_id INTEGER,
+                notified BOOLEAN DEFAULT 0,
+                FOREIGN KEY (filter_id) REFERENCES filters(id)
+            )''')
+    log("✅ БД ініціалізовано" + (" (PostgreSQL)" if USE_PG else " (SQLite)"))
     conn.commit()
     conn.close()
 
@@ -87,10 +139,52 @@ class FilterCreate(BaseModel):
 PROZORRO_API = "https://public-api.prozorro.gov.ua/api/2.5"
 
 
+# ── Простий стемер для українських слів ─────────────────────────────────────
+# Дозволяє знаходити "ноутбук" при запиті "ноутбуки" і навпаки.
+_UK_SUFFIXES = tuple(sorted([
+    'ськими', 'зьких', 'зьким', 'ськими', 'ському', 'ській',
+    'ними', 'ому', 'ами', 'ями', 'ків', 'ань', 'ими',
+    'ого', 'ій', 'им', 'ої', 'ів', 'ях', 'ям', 'ою', 'ею', 'ую',
+    'ам', 'ах', 'ий', 'их', 'їх',
+    'и', 'а', 'у', 'і', 'е', 'є', 'ю', 'я', 'ь',
+], key=len, reverse=True))
+
+
+def uk_stem(word: str) -> str:
+    """Видаляє типове українське закінчення → нормалізований корінь."""
+    for suffix in _UK_SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[:-len(suffix)]
+    return word
+
+
 def make_kw_list(keywords: Optional[str]):
     if not keywords:
         return []
-    return [k.strip().lower() for k in keywords.split(",") if k.strip()]
+    result = []
+    for k in keywords.split(","):
+        k = k.strip().lower()
+        if not k:
+            continue
+        result.append(k)
+        stem = uk_stem(k)
+        if stem != k:          # додаємо корінь для відмінкових форм
+            result.append(stem)
+    return list(dict.fromkeys(result))  # унікальні, зберігаємо порядок
+
+
+def kw_in_text(kw: str, text: str) -> bool:
+    """Перевірка з морфологічною толерантністю.
+    'ноутбуки' знайде 'ноутбук', 'комп'ютерів' знайде 'комп'ютер' і т.д.
+    Відрізає до 3 символів з кінця, залишаючи мінімум 4 символи стему.
+    """
+    if kw in text:
+        return True
+    for trim in range(1, 4):
+        if len(kw) - trim >= 4:
+            if kw[:-trim] in text:
+                return True
+    return False
 
 
 # ── Таблиця відповідності: область ↔ місто ───────────────────────────────────
@@ -196,17 +290,18 @@ def get_tender_date(dd: dict) -> str:
 def save_tender_now(filter_id: int, tender: dict) -> bool:
     """Зберігає тендер в БД одразу. Повертає True якщо новий."""
     try:
-        conn = sqlite3.connect('prozorro.db', timeout=10)
+        conn = get_conn()
         c = conn.cursor()
-        c.execute('SELECT id FROM tenders WHERE id = ?', (tender["id"],))
+        c.execute(f'SELECT id FROM tenders WHERE id = {P}', (tender["id"],))
         if c.fetchone():
             conn.close()
             return False
         c.execute(
-            '''INSERT OR IGNORE INTO tenders
+            f'''INSERT INTO tenders
                (id, title, procuring_entity, amount, cpv, region,
                 date_published, url, filter_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+               VALUES ({P},{P},{P},{P},{P},{P},{P},{P},{P})
+               ON CONFLICT (id) DO NOTHING''',
             (tender["id"], tender["title"], tender["procuringEntity"],
              tender["amount"], tender["cpv"], tender["region"],
              tender["datePublished"], tender["url"], filter_id)
@@ -214,7 +309,7 @@ def save_tender_now(filter_id: int, tender: dict) -> bool:
         saved = c.rowcount > 0
         if saved:
             c.execute(
-                'UPDATE filters SET found_count = found_count + 1 WHERE id = ?',
+                f'UPDATE filters SET found_count = found_count + 1 WHERE id = {P}',
                 (filter_id,)
             )
         conn.commit()
@@ -288,9 +383,10 @@ async def search_and_save(filter_id: int, keywords=None, cpv=None, region=None,
                         reached_boundary = True
                         break
 
-                    # Pre-filter по title
+                    # Pre-filter по title (з морфологічною толерантністю)
                     if list_title and kw_list:
-                        if not any(kw in list_title.lower() for kw in kw_list):
+                        lt_lower = list_title.lower()
+                        if not any(kw_in_text(kw, lt_lower) for kw in kw_list):
                             continue
 
                     # Detail-запит
@@ -376,7 +472,7 @@ def check_filter_detailed(tender, keywords, cpv, region, procuring_entity,
     if keywords:
         text    = (tender.get("title", "") + " " + tender.get("description", "")).lower()
         kw_list = make_kw_list(keywords)
-        if not any(kw in text for kw in kw_list):
+        if not any(kw_in_text(kw, text) for kw in kw_list):
             return {"matches": False,
                     "reason": f"Немає жодного з ключових слів '{keywords}' в тексті"}
 
@@ -398,8 +494,17 @@ def check_filter_detailed(tender, keywords, cpv, region, procuring_entity,
 
     if procuring_entity:
         entity = tender.get("procuringEntity", {}).get("name", "").lower()
-        if procuring_entity.lower() not in entity:
-            return {"matches": False, "reason": "Замовник не співпадає"}
+        # Пошук по кожному слову окремо (Prozorro зберігає назви у різних форматах:
+        # великі літери, різний порядок слів, скорочення тощо).
+        # Слова коротші за 3 символи ігноруємо (прийменники, артиклі).
+        search_words = [w for w in procuring_entity.lower().split() if len(w) >= 3]
+        if search_words and not all(kw_in_text(w, entity) for w in search_words):
+            return {"matches": False, "reason": f"Замовник не співпадає: шукали '{procuring_entity}', є '{entity[:80]}'"}
+        # Також перевіряємо identifier (ЄДРПОУ) якщо введено тільки цифри
+        if procuring_entity.strip().isdigit():
+            edrpou = tender.get("procuringEntity", {}).get("identifier", {}).get("id", "")
+            if procuring_entity.strip() not in edrpou:
+                return {"matches": False, "reason": f"ЄДРПОУ не співпадає"}
 
     if supplier:
         found = False
@@ -434,8 +539,37 @@ async def health():
     return {"status": "ok"}
 
 
+def _build_tender_response(tender_id: str, data: dict, prozorro_url: str, limited: bool = False) -> dict:
+    # Безпечне розпакування — Prozorro API може повертати null для деяких полів
+    items = data.get("items") or []
+    pe    = data.get("procuringEntity") or {}
+    addr  = pe.get("address") or {}
+    value = data.get("value") or {}
+    clf   = (items[0].get("classification") or {}) if items else {}
+    title  = data.get("title", "")
+    status = data.get("status", "")
+    log(f"   _build: title='{title[:60]}' status='{status}' pe='{pe.get('name','')[:40]}'")
+    return {
+        "id":              tender_id,
+        "limited":         limited,
+        "newTender":       False,
+        "title":           title,
+        "procuringEntity": pe.get("name", ""),
+        "amount":          value.get("amount", 0),
+        "currency":        value.get("currency", "UAH"),
+        "status":          status,
+        "datePublished":   get_tender_date(data),
+        "region":          addr.get("region", ""),
+        "locality":        addr.get("locality", ""),
+        "cpv":             clf.get("id", ""),
+        "cpvDescription":  clf.get("description", ""),
+        "url":             prozorro_url,
+    }
+
+
 @app.get("/api/tender/{tender_id}")
 async def get_tender_by_id(tender_id: str):
+    import re
     log(f"\n🔍 ПОШУК ТЕНДЕРА: {tender_id}")
     prozorro_url = f"https://prozorro.gov.ua/tender/{tender_id}"
     fallback = {
@@ -445,39 +579,27 @@ async def get_tender_by_id(tender_id: str):
         "datePublished": "", "region": "", "locality": "",
         "cpv": "", "cpvDescription": "", "url": prozorro_url,
     }
-
-    def build_full(data: dict) -> dict:
-        items = data.get("items", [])
-        return {
-            "id": tender_id, "limited": False, "newTender": False,
-            "title":           data.get("title", ""),
-            "procuringEntity": data.get("procuringEntity", {}).get("name", ""),
-            "amount":          data.get("value", {}).get("amount", 0),
-            "currency":        data.get("value", {}).get("currency", "UAH"),
-            "status":          data.get("status", ""),
-            "datePublished":   get_tender_date(data),
-            "region":          data.get("procuringEntity", {}).get("address", {}).get("region", ""),
-            "locality":        data.get("procuringEntity", {}).get("address", {}).get("locality", ""),
-            "cpv":             items[0].get("classification", {}).get("id", "") if items else "",
-            "cpvDescription":  items[0].get("classification", {}).get("description", "") if items else "",
-            "url":             prozorro_url,
-        }
+    is_ua_id = bool(re.match(r'^UA-\d{4}-\d{2}-\d{2}-', tender_id))
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0 ProzorroHunter/1.0"}) as client:
 
-            # Спроба 1: прямий запит (працює якщо tender_id — внутрішній UUID)
-            r1 = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
-            log(f"   Спроба 1 (direct) → {r1.status_code}")
-            if r1.status_code == 200:
-                return build_full(r1.json().get("data", {}))
+            # Спроба 1: прямий запит (працює тільки для внутрішніх hex-ID)
+            if not is_ua_id:
+                r1 = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
+                log(f"   Спроба 1 (hex) → {r1.status_code}")
+                if r1.status_code == 200:
+                    return _build_tender_response(tender_id, r1.json().get("data", {}), prozorro_url)
 
             # Спроба 2: пошук по людино-читабельному номеру UA-YYYY-MM-DD-...
-            # API повертає внутрішній UUID у полі "id", потім робимо detail-запит
+            # ?tenderID= фільтрує список і повертає внутрішній UUID у полі "id".
+            # ВАЖЛИВО: поле tenderID НЕ повертається в list-відповіді (тільки в detail),
+            # тому перевіряти item.get("tenderID") == tender_id не можна —
+            # просто беремо перший результат і робимо detail-запит.
             r2 = await client.get(
                 f"{PROZORRO_API}/tenders",
                 params={"tenderID": tender_id, "limit": 1,
-                        "opt_fields": "id,title,status,tenderID"}
+                        "opt_fields": "id,title,status"}
             )
             log(f"   Спроба 2 (tenderID param) → {r2.status_code}")
             if r2.status_code == 200:
@@ -489,8 +611,8 @@ async def get_tender_by_id(tender_id: str):
                         r3 = await client.get(f"{PROZORRO_API}/tenders/{internal_id}")
                         log(f"   Спроба 3 (detail) → {r3.status_code}")
                         if r3.status_code == 200:
-                            return build_full(r3.json().get("data", {}))
-                    # detail не вдався — повертаємо хоча б те що є
+                            return _build_tender_response(tender_id, r3.json().get("data", {}), prozorro_url)
+                    # detail не вдався — повертаємо хоча б те що маємо
                     t = lst[0]
                     return {**fallback, "limited": True,
                             "title": t.get("title", ""),
@@ -499,7 +621,6 @@ async def get_tender_by_id(tender_id: str):
             fallback["newTender"] = True
             log(f"   Тендер не знайдено — повертаємо fallback")
             return fallback
-
     except Exception as e:
         log(f"❌ EXCEPTION get_tender: {type(e).__name__}: {e}")
         return fallback
@@ -507,11 +628,11 @@ async def get_tender_by_id(tender_id: str):
 
 @app.get("/api/filters")
 async def get_filters():
-    conn = sqlite3.connect('prozorro.db')
+    conn = get_conn()
     c = conn.cursor()
     c.execute('''SELECT id, name, keywords, cpv, region, procuring_entity, supplier,
                  min_amount, max_amount, period_days, is_active, found_count
-                 FROM filters WHERE is_active = 1 ORDER BY id''')
+                 FROM filters WHERE is_active = TRUE ORDER BY id''')
     rows = c.fetchall()
     conn.close()
     return [{"id": r[0], "name": r[1], "keywords": r[2], "cpv": r[3],
@@ -521,19 +642,50 @@ async def get_filters():
             for r in rows]
 
 
-@app.post("/api/filters")
-async def create_filter(filter_data: FilterCreate, background_tasks: BackgroundTasks):
-    conn = sqlite3.connect('prozorro.db')
+@app.put("/api/filters/{filter_id}")
+async def update_filter(filter_id: int, filter_data: FilterCreate, background_tasks: BackgroundTasks):
+    conn = get_conn()
     c = conn.cursor()
     c.execute(
-        '''INSERT INTO filters (name, keywords, cpv, region, procuring_entity, supplier,
-                                min_amount, max_amount, period_days)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+        f'''UPDATE filters SET name={P}, keywords={P}, cpv={P}, region={P}, procuring_entity={P},
+           supplier={P}, min_amount={P}, max_amount={P}, period_days={P}
+           WHERE id={P} AND is_active = TRUE''',
         (filter_data.name, filter_data.keywords, filter_data.cpv,
          filter_data.region, filter_data.procuringEntity, filter_data.supplier,
-         filter_data.minAmount, filter_data.maxAmount, filter_data.periodDays)
+         filter_data.minAmount, filter_data.maxAmount, filter_data.periodDays,
+         filter_id)
     )
-    filter_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    log(f"\n✏️ Оновлено фільтр #{filter_id}: {filter_data.name}\n")
+    background_tasks.add_task(check_filter_task, filter_id)
+    return {"id": filter_id, "message": "Фільтр оновлено"}
+
+
+@app.post("/api/filters")
+async def create_filter(filter_data: FilterCreate, background_tasks: BackgroundTasks):
+    conn = get_conn()
+    c = conn.cursor()
+    if USE_PG:
+        c.execute(
+            f'''INSERT INTO filters (name, keywords, cpv, region, procuring_entity, supplier,
+                                    min_amount, max_amount, period_days)
+               VALUES ({P},{P},{P},{P},{P},{P},{P},{P},{P}) RETURNING id''',
+            (filter_data.name, filter_data.keywords, filter_data.cpv,
+             filter_data.region, filter_data.procuringEntity, filter_data.supplier,
+             filter_data.minAmount, filter_data.maxAmount, filter_data.periodDays)
+        )
+        filter_id = c.fetchone()[0]
+    else:
+        c.execute(
+            f'''INSERT INTO filters (name, keywords, cpv, region, procuring_entity, supplier,
+                                    min_amount, max_amount, period_days)
+               VALUES ({P},{P},{P},{P},{P},{P},{P},{P},{P})''',
+            (filter_data.name, filter_data.keywords, filter_data.cpv,
+             filter_data.region, filter_data.procuringEntity, filter_data.supplier,
+             filter_data.minAmount, filter_data.maxAmount, filter_data.periodDays)
+        )
+        filter_id = c.lastrowid
     conn.commit()
     conn.close()
     log(f"\n✅ Створено фільтр #{filter_id}: {filter_data.name}\n")
@@ -550,9 +702,9 @@ async def search_filter_now(filter_id: int, background_tasks: BackgroundTasks):
 
 @app.delete("/api/filters/{filter_id}")
 async def delete_filter(filter_id: int):
-    conn = sqlite3.connect('prozorro.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute('UPDATE filters SET is_active = 0 WHERE id = ?', (filter_id,))
+    c.execute(f'UPDATE filters SET is_active = FALSE WHERE id = {P}', (filter_id,))
     conn.commit()
     conn.close()
     log(f"\n🗑️ Видалено фільтр #{filter_id}\n")
@@ -561,21 +713,21 @@ async def delete_filter(filter_id: int):
 
 @app.get("/api/tenders")
 async def get_tenders(limit: int = 200, filter_id: Optional[int] = None):
-    conn = sqlite3.connect('prozorro.db')
+    conn = get_conn()
     c = conn.cursor()
     if filter_id:
         c.execute(
-            '''SELECT t.id, t.title, t.procuring_entity, t.amount, t.cpv, t.region,
+            f'''SELECT t.id, t.title, t.procuring_entity, t.amount, t.cpv, t.region,
                       t.date_published, t.url, t.filter_id, f.name
                FROM tenders t LEFT JOIN filters f ON t.filter_id = f.id
-               WHERE t.filter_id = ? ORDER BY t.date_published DESC LIMIT ?''',
+               WHERE t.filter_id = {P} ORDER BY t.date_published DESC LIMIT {P}''',
             (filter_id, limit))
     else:
         c.execute(
-            '''SELECT t.id, t.title, t.procuring_entity, t.amount, t.cpv, t.region,
+            f'''SELECT t.id, t.title, t.procuring_entity, t.amount, t.cpv, t.region,
                       t.date_published, t.url, t.filter_id, f.name
                FROM tenders t LEFT JOIN filters f ON t.filter_id = f.id
-               ORDER BY t.date_published DESC LIMIT ?''',
+               ORDER BY t.date_published DESC LIMIT {P}''',
             (limit,))
     rows = c.fetchall()
     conn.close()
@@ -588,7 +740,7 @@ async def get_tenders(limit: int = 200, filter_id: Optional[int] = None):
 
 @app.delete("/api/tenders/all")
 async def clear_all_tenders():
-    conn = sqlite3.connect('prozorro.db')
+    conn = get_conn()
     c = conn.cursor()
     c.execute('DELETE FROM tenders')
     c.execute('UPDATE filters SET found_count = 0')
@@ -599,10 +751,10 @@ async def clear_all_tenders():
 
 @app.delete("/api/tenders/filter/{filter_id}")
 async def clear_filter_tenders(filter_id: int):
-    conn = sqlite3.connect('prozorro.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute('DELETE FROM tenders WHERE filter_id = ?', (filter_id,))
-    c.execute('UPDATE filters SET found_count = 0 WHERE id = ?', (filter_id,))
+    c.execute(f'DELETE FROM tenders WHERE filter_id = {P}', (filter_id,))
+    c.execute(f'UPDATE filters SET found_count = 0 WHERE id = {P}', (filter_id,))
     conn.commit()
     conn.close()
     return {"message": f"Тендери фільтра #{filter_id} очищено"}
@@ -610,30 +762,38 @@ async def clear_filter_tenders(filter_id: int):
 
 @app.get("/api/stats")
 async def get_stats():
-    conn = sqlite3.connect('prozorro.db')
+    conn = get_conn()
     c = conn.cursor()
     c.execute('SELECT COUNT(*) FROM tenders')
     total = c.fetchone()[0]
     today = datetime.now().date().isoformat()
-    c.execute('SELECT COUNT(*) FROM tenders WHERE DATE(date_published) = ?', (today,))
+    c.execute(f'SELECT COUNT(*) FROM tenders WHERE DATE(date_published) = {P}', (today,))
     today_count = c.fetchone()[0]
-    c.execute('SELECT COUNT(*) FROM filters WHERE is_active = 1')
+    c.execute('SELECT COUNT(*) FROM filters WHERE is_active = TRUE')
     active_filters = c.fetchone()[0]
     conn.close()
     return {"total": total, "today": today_count, "active": active_filters}
 
 
+@app.get("/api/filters/{filter_id}/searching")
+async def is_filter_searching(filter_id: int):
+    return {"searching": filter_id in _active_searches or filter_id in _queued_searches}
+
+
 async def check_filter_task(filter_id: int):
+    _queued_searches.add(filter_id)
     log(f"⏳ Фільтр #{filter_id}: очікую черги...")
     async with _search_lock:
+        _queued_searches.discard(filter_id)
+        _active_searches.add(filter_id)
         log(f"🔒 Фільтр #{filter_id}: починаю")
         try:
-            conn = sqlite3.connect('prozorro.db')
+            conn = get_conn()
             c = conn.cursor()
             c.execute(
-                '''SELECT keywords, cpv, region, procuring_entity, supplier,
+                f'''SELECT keywords, cpv, region, procuring_entity, supplier,
                           min_amount, max_amount, period_days
-                   FROM filters WHERE id = ? AND is_active = 1''',
+                   FROM filters WHERE id = {P} AND is_active = TRUE''',
                 (filter_id,))
             fd = c.fetchone()
             conn.close()
@@ -651,6 +811,8 @@ async def check_filter_task(filter_id: int):
         except Exception as e:
             log(f"❌ ПОМИЛКА check_filter_task #{filter_id}: {e}")
             log(traceback.format_exc())
+        finally:
+            _active_searches.discard(filter_id)
 
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -659,3 +821,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
