@@ -445,46 +445,61 @@ async def get_tender_by_id(tender_id: str):
         "datePublished": "", "region": "", "locality": "",
         "cpv": "", "cpvDescription": "", "url": prozorro_url,
     }
+
+    def build_full(data: dict) -> dict:
+        items = data.get("items", [])
+        return {
+            "id": tender_id, "limited": False, "newTender": False,
+            "title":           data.get("title", ""),
+            "procuringEntity": data.get("procuringEntity", {}).get("name", ""),
+            "amount":          data.get("value", {}).get("amount", 0),
+            "currency":        data.get("value", {}).get("currency", "UAH"),
+            "status":          data.get("status", ""),
+            "datePublished":   get_tender_date(data),
+            "region":          data.get("procuringEntity", {}).get("address", {}).get("region", ""),
+            "locality":        data.get("procuringEntity", {}).get("address", {}).get("locality", ""),
+            "cpv":             items[0].get("classification", {}).get("id", "") if items else "",
+            "cpvDescription":  items[0].get("classification", {}).get("description", "") if items else "",
+            "url":             prozorro_url,
+        }
+
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
+
+            # Спроба 1: прямий запит (працює якщо tender_id — внутрішній UUID)
             r1 = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
-            log(f"   Спроба 1 → {r1.status_code}")
+            log(f"   Спроба 1 (direct) → {r1.status_code}")
             if r1.status_code == 200:
-                data  = r1.json().get("data", {})
-                items = data.get("items", [])
-                return {
-                    "id": tender_id, "limited": False, "newTender": False,
-                    "title":          data.get("title", ""),
-                    "procuringEntity":data.get("procuringEntity", {}).get("name", ""),
-                    "amount":         data.get("value", {}).get("amount", 0),
-                    "currency":       data.get("value", {}).get("currency", "UAH"),
-                    "status":         data.get("status", ""),
-                    "datePublished":  get_tender_date(data),
-                    "region":         data.get("procuringEntity", {}).get("address", {}).get("region", ""),
-                    "locality":       data.get("procuringEntity", {}).get("address", {}).get("locality", ""),
-                    "cpv":            items[0].get("classification", {}).get("id", "") if items else "",
-                    "cpvDescription": items[0].get("classification", {}).get("description", "") if items else "",
-                    "url":            prozorro_url,
-                }
-            r2 = await client.get(f"{PROZORRO_API}/tenders",
-                                   params={"id": tender_id, "limit": 1})
+                return build_full(r1.json().get("data", {}))
+
+            # Спроба 2: пошук по людино-читабельному номеру UA-YYYY-MM-DD-...
+            # API повертає внутрішній UUID у полі "id", потім робимо detail-запит
+            r2 = await client.get(
+                f"{PROZORRO_API}/tenders",
+                params={"tenderID": tender_id, "limit": 1,
+                        "opt_fields": "id,title,status,tenderID"}
+            )
+            log(f"   Спроба 2 (tenderID param) → {r2.status_code}")
             if r2.status_code == 200:
                 lst = r2.json().get("data", [])
                 if lst:
+                    internal_id = lst[0].get("id", "")
+                    log(f"   Знайдено internal_id: {internal_id}")
+                    if internal_id:
+                        r3 = await client.get(f"{PROZORRO_API}/tenders/{internal_id}")
+                        log(f"   Спроба 3 (detail) → {r3.status_code}")
+                        if r3.status_code == 200:
+                            return build_full(r3.json().get("data", {}))
+                    # detail не вдався — повертаємо хоча б те що є
                     t = lst[0]
-                    return {**fallback, "limited": True, "newTender": False,
-                            "title": t.get("title", ""), "status": t.get("status", "unknown"),
-                            "datePublished": get_tender_date(t)}
-            r3 = await client.get(f"{PROZORRO_API}/tenders",
-                                   params={"descending": "1", "limit": "50",
-                                           "opt_fields": "id,title,status,dateModified"})
-            if r3.status_code == 200:
-                for t in r3.json().get("data", []):
-                    if t.get("id") == tender_id:
-                        return {**fallback, "limited": True, "newTender": False,
-                                "title": t.get("title", ""), "status": t.get("status", "unknown")}
+                    return {**fallback, "limited": True,
+                            "title": t.get("title", ""),
+                            "status": t.get("status", "unknown")}
+
             fallback["newTender"] = True
+            log(f"   Тендер не знайдено — повертаємо fallback")
             return fallback
+
     except Exception as e:
         log(f"❌ EXCEPTION get_tender: {type(e).__name__}: {e}")
         return fallback
