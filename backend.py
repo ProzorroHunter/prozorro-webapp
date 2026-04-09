@@ -10,7 +10,6 @@ from datetime import datetime, timedelta
 import sqlite3
 import os
 import traceback
-import re
 
 try:
     import psycopg2
@@ -29,14 +28,18 @@ app.add_middleware(
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 _search_lock     = asyncio.Lock()
-_active_searches: set = set()
-_queued_searches: set = set()
+_active_searches: set = set()   # filter IDs зараз в пошуку
+_queued_searches: set = set()   # filter IDs в черзі (чекають lock)
 
+# DATABASE_URL — рядок підключення PostgreSQL (для Render/Neon).
+# Якщо не задано — використовується локальний SQLite файл.
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 DB_PATH = os.getenv("DB_PATH", "prozorro.db")
 USE_PG = bool(DATABASE_URL and psycopg2)
 
+# Плейсхолдер параметрів: %s для PostgreSQL, ? для SQLite
 P = "%s" if USE_PG else "?"
+
 
 def get_conn():
     if USE_PG:
@@ -45,8 +48,10 @@ def get_conn():
         return conn
     return sqlite3.connect(DB_PATH, timeout=10)
 
+
 def log(*args):
     print(*args, flush=True)
+
 
 def init_db():
     conn = get_conn()
@@ -115,7 +120,9 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 init_db()
+
 
 class FilterCreate(BaseModel):
     name: str
@@ -128,8 +135,12 @@ class FilterCreate(BaseModel):
     maxAmount: Optional[float] = None
     periodDays: Optional[int] = 30
 
+
 PROZORRO_API = "https://public-api.prozorro.gov.ua/api/2.5"
 
+
+# ── Простий стемер для українських слів ─────────────────────────────────────
+# Дозволяє знаходити "ноутбук" при запиті "ноутбуки" і навпаки.
 _UK_SUFFIXES = tuple(sorted([
     'ськими', 'зьких', 'зьким', 'ськими', 'ському', 'ській',
     'ними', 'ому', 'ами', 'ями', 'ків', 'ань', 'ими',
@@ -138,11 +149,14 @@ _UK_SUFFIXES = tuple(sorted([
     'и', 'а', 'у', 'і', 'е', 'є', 'ю', 'я', 'ь',
 ], key=len, reverse=True))
 
+
 def uk_stem(word: str) -> str:
+    """Видаляє типове українське закінчення → нормалізований корінь."""
     for suffix in _UK_SUFFIXES:
         if word.endswith(suffix) and len(word) - len(suffix) >= 3:
             return word[:-len(suffix)]
     return word
+
 
 def make_kw_list(keywords: Optional[str]):
     if not keywords:
@@ -154,11 +168,16 @@ def make_kw_list(keywords: Optional[str]):
             continue
         result.append(k)
         stem = uk_stem(k)
-        if stem != k:
+        if stem != k:          # додаємо корінь для відмінкових форм
             result.append(stem)
-    return list(dict.fromkeys(result))
+    return list(dict.fromkeys(result))  # унікальні, зберігаємо порядок
+
 
 def kw_in_text(kw: str, text: str) -> bool:
+    """Перевірка з морфологічною толерантністю.
+    'ноутбуки' знайде 'ноутбук', 'комп'ютерів' знайде 'комп'ютер' і т.д.
+    Відрізає до 3 символів з кінця, залишаючи мінімум 4 символи стему.
+    """
     if kw in text:
         return True
     for trim in range(1, 4):
@@ -166,6 +185,12 @@ def kw_in_text(kw: str, text: str) -> bool:
             if kw[:-trim] in text:
                 return True
     return False
+
+
+# ── Таблиця відповідності: область ↔ місто ───────────────────────────────────
+# Prozorro зберігає тендери міста Харків як region="місто Харків",
+# а тендери Харківської ОБЛАСТІ як region="Харківська область".
+# Ця таблиця дозволяє фільтру "Харківська область" знаходити обидва типи.
 
 OBLAST_ALIASES: dict[str, list[str]] = {
     "харківська":       ["харків",            "місто харків"],
@@ -194,20 +219,32 @@ OBLAST_ALIASES: dict[str, list[str]] = {
     "волинська":        ["луцьк",             "місто луцьк"],
 }
 
+# Зворотня: місто → область (для пошуку по місту — знаходить і область)
 CITY_TO_OBLAST: dict[str, str] = {}
 for oblast_key, cities in OBLAST_ALIASES.items():
     for city in cities:
         CITY_TO_OBLAST[city] = oblast_key
 
+
 def region_matches(searched: str, t_region: str, t_locality: str) -> bool:
+    """
+    Гнучкий матчинг регіону з урахуванням того що Prozorro зберігає:
+      - Тендери великих міст: region="місто Харків"
+      - Тендери решти області: region="Харківська область"
+
+    Фільтр "Харківська область" знаходить обидва типи.
+    Фільтр "Харків" (місто) теж знаходить обидва типи.
+    """
     s  = searched.lower().strip()
     tr = t_region.lower().strip()
     tl = t_locality.lower().strip()
     full_address = f"{tr} {tl}".strip()
 
+    # 1. Пряме входження
     if s in full_address:
         return True
 
+    # Нормалізована версія (без "область", "місто", "м.")
     def norm(r: str) -> str:
         return (r.replace(" область", "").replace("область", "")
                   .replace("місто ", "").replace("м. ", "")
@@ -216,18 +253,23 @@ def region_matches(searched: str, t_region: str, t_locality: str) -> bool:
     sn       = norm(s)
     full_n   = norm(full_address)
 
+    # 2. Нормалізоване входження
     if sn and sn in full_n:
         return True
     if norm(tr) and norm(tr) in sn:
         return True
 
+    # 3. Oblast → City aliases (головний виправлений баг)
+    #    "Харківська область" → шукаємо "харків" у повній адресі
     for oblast_key, city_list in OBLAST_ALIASES.items():
-        if oblast_key in sn:
+        if oblast_key in sn:                    # шукаємо по "харківська"
             for city in city_list:
                 if city in full_address or city in full_n:
                     return True
             break
 
+    # 4. City → Oblast (зворотній)
+    #    "Харків" → перевіряємо чи адреса містить "харківська"
     for city_key, oblast_key in CITY_TO_OBLAST.items():
         if city_key == sn or sn in city_key:
             if oblast_key in full_n or oblast_key in norm(tr):
@@ -235,14 +277,18 @@ def region_matches(searched: str, t_region: str, t_locality: str) -> bool:
 
     return False
 
+
 def get_tender_date(dd: dict) -> str:
+    """Повертає найкращу дату публікації тендера з кількох можливих полів API."""
     return (dd.get("datePublished")
             or dd.get("date")
             or dd.get("tenderPeriod", {}).get("startDate")
             or dd.get("enquiryPeriod", {}).get("startDate")
             or "")
 
+
 def save_tender_now(filter_id: int, tender: dict) -> bool:
+    """Зберігає тендер в БД одразу. Повертає True якщо новий."""
     try:
         conn = get_conn()
         c = conn.cursor()
@@ -272,6 +318,7 @@ def save_tender_now(filter_id: int, tender: dict) -> bool:
     except Exception as e:
         log(f"   ⚠️ Помилка збереження: {e}")
         return False
+
 
 async def search_and_save(filter_id: int, keywords=None, cpv=None, region=None,
                           procuring_entity=None, supplier=None,
@@ -336,11 +383,13 @@ async def search_and_save(filter_id: int, keywords=None, cpv=None, region=None,
                         reached_boundary = True
                         break
 
+                    # Pre-filter по title (з морфологічною толерантністю)
                     if list_title and kw_list:
                         lt_lower = list_title.lower()
                         if not any(kw_in_text(kw, lt_lower) for kw in kw_list):
                             continue
 
+                    # Detail-запит
                     total_details += 1
                     try:
                         dr = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
@@ -386,6 +435,7 @@ async def search_and_save(filter_id: int, keywords=None, cpv=None, region=None,
                             break
 
                     else:
+                        # Детальне логування регіон-відмов — всі, без ліміту
                         if region and "Регіон" in result["reason"]:
                             region_rejects += 1
                             addr    = dd.get("procuringEntity", {}).get("address", {})
@@ -416,6 +466,7 @@ async def search_and_save(filter_id: int, keywords=None, cpv=None, region=None,
     log(f"   📈 Збережено: {total_saved} нових тендерів\n")
     return total_saved
 
+
 def check_filter_detailed(tender, keywords, cpv, region, procuring_entity,
                            supplier, min_amount, max_amount):
     if keywords:
@@ -443,9 +494,13 @@ def check_filter_detailed(tender, keywords, cpv, region, procuring_entity,
 
     if procuring_entity:
         entity = tender.get("procuringEntity", {}).get("name", "").lower()
+        # Пошук по кожному слову окремо (Prozorro зберігає назви у різних форматах:
+        # великі літери, різний порядок слів, скорочення тощо).
+        # Слова коротші за 3 символи ігноруємо (прийменники, артиклі).
         search_words = [w for w in procuring_entity.lower().split() if len(w) >= 3]
         if search_words and not all(kw_in_text(w, entity) for w in search_words):
             return {"matches": False, "reason": f"Замовник не співпадає: шукали '{procuring_entity}', є '{entity[:80]}'"}
+        # Також перевіряємо identifier (ЄДРПОУ) якщо введено тільки цифри
         if procuring_entity.strip().isdigit():
             edrpou = tender.get("procuringEntity", {}).get("identifier", {}).get("id", "")
             if procuring_entity.strip() not in edrpou:
@@ -470,6 +525,7 @@ def check_filter_detailed(tender, keywords, cpv, region, procuring_entity,
 
     return {"matches": True, "reason": "OK"}
 
+
 # ══════════════════════════════════════════════════════
 #  ROUTES
 # ══════════════════════════════════════════════════════
@@ -482,7 +538,9 @@ async def root():
 async def health():
     return {"status": "ok"}
 
+
 def _build_tender_response(tender_id: str, data: dict, prozorro_url: str, limited: bool = False) -> dict:
+    # Безпечне розпакування — Prozorro API може повертати null для деяких полів
     items = data.get("items") or []
     pe    = data.get("procuringEntity") or {}
     addr  = pe.get("address") or {}
@@ -508,8 +566,10 @@ def _build_tender_response(tender_id: str, data: dict, prozorro_url: str, limite
         "url":             prozorro_url,
     }
 
+
 @app.get("/api/tender/{tender_id}")
 async def get_tender_by_id(tender_id: str):
+    import re, json as _json
     log(f"\n🔍 ПОШУК ТЕНДЕРА: {tender_id}")
     prozorro_url = f"https://prozorro.gov.ua/tender/{tender_id}"
     fallback = {
@@ -520,10 +580,6 @@ async def get_tender_by_id(tender_id: str):
         "cpv": "", "cpvDescription": "", "url": prozorro_url,
     }
     is_ua_id = bool(re.match(r'^UA-\d{4}-\d{2}-\d{2}-', tender_id))
-
-    if is_ua_id:
-        log(f"   UA-формат: деталі через public API обмежені (Prozorro 2026). Повертаємо чисте посилання.")
-        return fallback
 
     BROWSER_HEADERS = {
         "User-Agent": (
@@ -536,6 +592,7 @@ async def get_tender_by_id(tender_id: str):
     }
 
     async def try_detail_by_hex(client, hex_id: str) -> dict:
+        """Fetch detail by internal hex UUID, return data dict or {}."""
         try:
             r = await client.get(f"{PROZORRO_API}/tenders/{hex_id}", timeout=10.0)
             if r.status_code == 200:
@@ -551,17 +608,22 @@ async def get_tender_by_id(tender_id: str):
             follow_redirects=True,
         ) as client:
 
-            log(f"   Спроба 1 (hex direct)...")
-            data = await try_detail_by_hex(client, tender_id)
-            if data:
-                log(f"   ✅ Знайдено через hex!")
-                return _build_tender_response(tender_id, data, prozorro_url)
+            # ── Спроба 1: прямий запит (працює для внутрішніх hex-ID) ────────
+            if not is_ua_id:
+                log(f"   Спроба 1 (hex direct)...")
+                data = await try_detail_by_hex(client, tender_id)
+                if data:
+                    log(f"   ✅ Спроба 1 → знайдено")
+                    return _build_tender_response(tender_id, data, prozorro_url)
 
-            # Спроба 2
+            # ── Спроба 2: public API ?tenderID= з перевіркою ─────────────────
+            # Параметр іноді ігнорується API, але якщо opt_fields повертає
+            # поле tenderID — перевіряємо точний збіг перед detail-запитом.
             try:
                 r2 = await client.get(
                     f"{PROZORRO_API}/tenders",
-                    params={"tenderID": tender_id, "opt_fields": "id,tenderID", "limit": 5},
+                    params={"tenderID": tender_id,
+                            "opt_fields": "id,tenderID", "limit": 5},
                     timeout=10.0,
                 )
                 log(f"   Спроба 2 (public API tenderID) → {r2.status_code}")
@@ -575,7 +637,9 @@ async def get_tender_by_id(tender_id: str):
             except Exception as e:
                 log(f"   Спроба 2 error: {e}")
 
-            # Спроба 3
+            # ── Спроба 3: prozorro.gov.ua internal JSON API ───────────────────
+            # Сайт prozorro.gov.ua має власний бекенд, який може підтримувати
+            # пошук за UA-номером. Пробуємо кілька потенційних ендпоінтів.
             for url in [
                 f"https://prozorro.gov.ua/api/tenders/{tender_id}",
                 f"https://prozorro.gov.ua/api/tender/{tender_id}",
@@ -587,9 +651,11 @@ async def get_tender_by_id(tender_id: str):
                         headers={**BROWSER_HEADERS, "Accept": "application/json"},
                         timeout=8.0,
                     )
-                    log(f"   Спроба 3 {url} → {r.status_code}, ct={r.headers.get('content-type','?')[:40]}")
+                    log(f"   Спроба 3 {url} → {r.status_code}, "
+                        f"ct={r.headers.get('content-type','?')[:40]}")
                     if r.status_code == 200 and "json" in r.headers.get("content-type", ""):
                         jdata = r.json()
+                        # Відповідь може бути {data: {...}} або одразу тендером
                         candidates = [jdata.get("data", jdata)]
                         if isinstance(jdata.get("data"), list):
                             candidates = jdata["data"]
@@ -597,17 +663,22 @@ async def get_tender_by_id(tender_id: str):
                             if isinstance(td, dict) and td.get("tenderID") == tender_id:
                                 log(f"   ✅ Знайдено через prozorro.gov.ua API!")
                                 return _build_tender_response(tender_id, td, prozorro_url)
+                        log(f"   JSON preview: {str(jdata)[:150]}")
                 except Exception as e:
                     log(f"   Спроба 3 {url} error: {e}")
 
-            # Спроба 4
+            # ── Спроба 4: web scrape з повними browser-заголовками ────────────
+            # prozorro.gov.ua — це JS SPA (818-символьна оболонка без SSR),
+            # UUID у HTML не буде, але логуємо вміст для діагностики.
             try:
                 rw = await client.get(
                     f"https://prozorro.gov.ua/uk/tender/{tender_id}",
-                    headers={**BROWSER_HEADERS, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"},
+                    headers={**BROWSER_HEADERS,
+                             "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"},
                     timeout=12.0,
                 )
                 log(f"   Спроба 4 (web) → {rw.status_code}, {len(rw.text)} chars")
+                log(f"   HTML[0:500]: {rw.text[:500]!r}")
                 if rw.status_code == 200:
                     hex_ids = list(dict.fromkeys(
                         re.findall(r'\b([0-9a-f]{32})\b', rw.text)
@@ -621,12 +692,14 @@ async def get_tender_by_id(tender_id: str):
             except Exception as e:
                 log(f"   Спроба 4 error: {e}")
 
+            # ── Fallback ──────────────────────────────────────────────────────
             log(f"   ⚠️ Усі спроби вичерпано — повертаємо посилання")
             return {**fallback, "newTender": False}
 
     except Exception as e:
         log(f"❌ EXCEPTION get_tender: {type(e).__name__}: {e}")
         return fallback
+
 
 @app.get("/api/filters")
 async def get_filters():
@@ -642,6 +715,7 @@ async def get_filters():
              "minAmount": r[7], "maxAmount": r[8], "periodDays": r[9],
              "isActive": bool(r[10]), "foundCount": r[11]}
             for r in rows]
+
 
 @app.put("/api/filters/{filter_id}")
 async def update_filter(filter_id: int, filter_data: FilterCreate, background_tasks: BackgroundTasks):
@@ -661,6 +735,7 @@ async def update_filter(filter_id: int, filter_data: FilterCreate, background_ta
     log(f"\n✏️ Оновлено фільтр #{filter_id}: {filter_data.name}\n")
     background_tasks.add_task(check_filter_task, filter_id)
     return {"id": filter_id, "message": "Фільтр оновлено"}
+
 
 @app.post("/api/filters")
 async def create_filter(filter_data: FilterCreate, background_tasks: BackgroundTasks):
@@ -692,11 +767,13 @@ async def create_filter(filter_data: FilterCreate, background_tasks: BackgroundT
     background_tasks.add_task(check_filter_task, filter_id)
     return {"id": filter_id, "message": "Фільтр створено"}
 
+
 @app.post("/api/filters/{filter_id}/search")
 async def search_filter_now(filter_id: int, background_tasks: BackgroundTasks):
     log(f"\n🚀 Ручний пошук для фільтра #{filter_id}\n")
     background_tasks.add_task(check_filter_task, filter_id)
     return {"message": "Пошук запущено"}
+
 
 @app.delete("/api/filters/{filter_id}")
 async def delete_filter(filter_id: int):
@@ -707,6 +784,7 @@ async def delete_filter(filter_id: int):
     conn.close()
     log(f"\n🗑️ Видалено фільтр #{filter_id}\n")
     return {"message": "Фільтр видалено"}
+
 
 @app.get("/api/tenders")
 async def get_tenders(limit: int = 200, filter_id: Optional[int] = None):
@@ -734,6 +812,7 @@ async def get_tenders(limit: int = 200, filter_id: Optional[int] = None):
              "filterId": r[8], "filterName": r[9]}
             for r in rows]
 
+
 @app.delete("/api/tenders/all")
 async def clear_all_tenders():
     conn = get_conn()
@@ -744,6 +823,7 @@ async def clear_all_tenders():
     conn.close()
     return {"message": "Всі тендери очищено"}
 
+
 @app.delete("/api/tenders/filter/{filter_id}")
 async def clear_filter_tenders(filter_id: int):
     conn = get_conn()
@@ -753,6 +833,7 @@ async def clear_filter_tenders(filter_id: int):
     conn.commit()
     conn.close()
     return {"message": f"Тендери фільтра #{filter_id} очищено"}
+
 
 @app.get("/api/stats")
 async def get_stats():
@@ -768,9 +849,11 @@ async def get_stats():
     conn.close()
     return {"total": total, "today": today_count, "active": active_filters}
 
+
 @app.get("/api/filters/{filter_id}/searching")
 async def is_filter_searching(filter_id: int):
     return {"searching": filter_id in _active_searches or filter_id in _queued_searches}
+
 
 async def check_filter_task(filter_id: int):
     _queued_searches.add(filter_id)
@@ -806,10 +889,13 @@ async def check_filter_task(filter_id: int):
         finally:
             _active_searches.discard(filter_id)
 
+
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+
 
