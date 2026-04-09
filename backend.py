@@ -589,97 +589,38 @@ async def get_tender_by_id(tender_id: str):
                 r1 = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
                 log(f"   Спроба 1 (hex) → {r1.status_code}")
                 if r1.status_code == 200:
-                    data = r1.json().get("data", {})
-                    return _build_tender_response(tender_id, data, prozorro_url)
+                    return _build_tender_response(tender_id, r1.json().get("data", {}), prozorro_url)
 
-            # Спроба 2: UA- ID безпосередньо в path (деякі версії API підтримують)
-            r2 = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
-            log(f"   Спроба 2 (UA path) → {r2.status_code}")
+            # Спроба 2: пошук по людино-читабельному номеру UA-YYYY-MM-DD-...
+            # ?tenderID= фільтрує список і повертає внутрішній UUID у полі "id".
+            # ВАЖЛИВО: поле tenderID НЕ повертається в list-відповіді (тільки в detail),
+            # тому перевіряти item.get("tenderID") == tender_id не можна —
+            # просто беремо перший результат і робимо detail-запит.
+            r2 = await client.get(
+                f"{PROZORRO_API}/tenders",
+                params={"tenderID": tender_id, "limit": 1,
+                        "opt_fields": "id,title,status"}
+            )
+            log(f"   Спроба 2 (tenderID param) → {r2.status_code}")
             if r2.status_code == 200:
-                data = r2.json().get("data", {})
-                if data:
-                    return _build_tender_response(tender_id, data, prozorro_url)
+                lst = r2.json().get("data", [])
+                if lst:
+                    internal_id = lst[0].get("id", "")
+                    log(f"   Знайдено internal_id: {internal_id}")
+                    if internal_id:
+                        r3 = await client.get(f"{PROZORRO_API}/tenders/{internal_id}")
+                        log(f"   Спроба 3 (detail) → {r3.status_code}")
+                        if r3.status_code == 200:
+                            return _build_tender_response(tender_id, r3.json().get("data", {}), prozorro_url)
+                    # detail не вдався — повертаємо хоча б те що маємо
+                    t = lst[0]
+                    return {**fallback, "limited": True,
+                            "title": t.get("title", ""),
+                            "status": t.get("status", "unknown")}
 
-            # Спроба 3: ?tenderID= як параметр фільтру (якщо API підтримує)
-            r3 = await client.get(f"{PROZORRO_API}/tenders",
-                                  params={"tenderID": tender_id, "opt_fields": "id,tenderID", "limit": "3"})
-            log(f"   Спроба 3 (tenderID param) → {r3.status_code}")
-            if r3.status_code == 200:
-                for item in r3.json().get("data", []):
-                    if item.get("tenderID") == tender_id:
-                        rd = await client.get(f"{PROZORRO_API}/tenders/{item['id']}")
-                        if rd.status_code == 200:
-                            return _build_tender_response(tender_id, rd.json().get("data", {}), prozorro_url)
-
-            # Спроба 4: Ascending scan від дати в UA-номері (UA-YYYY-MM-DD-...)
-            # Це єдиний надійний спосіб — tenderID є лише в detail-відповіді,
-            # але ми знаємо приблизну дату тендера з самого ID.
-            date_match = re.match(r'^UA-(\d{4}-\d{2}-\d{2})', tender_id) if is_ua_id else None
-            scan_date  = date_match.group(1) if date_match else datetime.now().strftime("%Y-%m-%d")
-            stop_date  = (datetime.strptime(scan_date, "%Y-%m-%d") + timedelta(days=2)).strftime("%Y-%m-%d")
-            log(f"   Спроба 4: ascending scan від {scan_date} (до {stop_date})...")
-
-            sem = asyncio.Semaphore(25)
-
-            async def fetch_detail(iid: str) -> dict:
-                async with sem:
-                    try:
-                        rd = await client.get(f"{PROZORRO_API}/tenders/{iid}", timeout=8.0)
-                        if rd.status_code == 200:
-                            return rd.json().get("data") or {}
-                    except Exception:
-                        pass
-                return {}
-
-            scan_offset = f"{scan_date}T00:00:00"
-            for page in range(20):
-                params = {
-                    "opt_fields": "id,tenderID,dateModified",
-                    "limit": "100",
-                    "offset": scan_offset,
-                }
-                r = await client.get(f"{PROZORRO_API}/tenders", params=params)
-                if r.status_code != 200:
-                    break
-                body  = r.json()
-                items = body.get("data", [])
-                if not items:
-                    break
-
-                first_d = items[0].get("dateModified", "")[:10]
-                last_d  = items[-1].get("dateModified", "")[:10]
-                log(f"   Стор.{page+1}: {len(items)} | {first_d}→{last_d}")
-
-                # Вийшли за межу пошуку — тендер точно не тут
-                if first_d > stop_date:
-                    log(f"   ⏹ Пройшли дату {stop_date}, зупиняємось")
-                    break
-
-                # Швидкий шлях: tenderID в list-відповіді (якщо API підтримує)
-                for item in items:
-                    if item.get("tenderID") == tender_id:
-                        log(f"   ✅ Знайдено tenderID в list (стор.{page+1})!")
-                        rd = await client.get(f"{PROZORRO_API}/tenders/{item['id']}")
-                        if rd.status_code == 200:
-                            return _build_tender_response(tender_id, rd.json().get("data") or {}, prozorro_url)
-
-                # Повільний шлях: detail-запит для всіх сторінок у вікні дати
-                # (tenderID є лише в detail, не в list)
-                if last_d <= stop_date:
-                    details = await asyncio.gather(*[fetch_detail(it["id"]) for it in items])
-                    for detail in details:
-                        if detail.get("tenderID") == tender_id:
-                            log(f"   ✅ Знайдено через detail-scan (стор.{page+1})!")
-                            return _build_tender_response(tender_id, detail, prozorro_url)
-
-                # Наступна сторінка
-                next_off = body.get("next_page", {}).get("offset")
-                if not next_off:
-                    break
-                scan_offset = next_off
-
-            log(f"   ⚠️ Не знайдено через API, повертаємо посилання на Prozorro")
-            return {**fallback, "limited": True, "newTender": False}
+            fallback["newTender"] = True
+            log(f"   Тендер не знайдено — повертаємо fallback")
+            return fallback
     except Exception as e:
         log(f"❌ EXCEPTION get_tender: {type(e).__name__}: {e}")
         return fallback
