@@ -569,7 +569,7 @@ def _build_tender_response(tender_id: str, data: dict, prozorro_url: str, limite
 
 @app.get("/api/tender/{tender_id}")
 async def get_tender_by_id(tender_id: str):
-    import re, json as _json
+    import re
     log(f"\n🔍 ПОШУК ТЕНДЕРА: {tender_id}")
     prozorro_url = f"https://prozorro.gov.ua/tender/{tender_id}"
     fallback = {
@@ -581,18 +581,34 @@ async def get_tender_by_id(tender_id: str):
     }
     is_ua_id = bool(re.match(r'^UA-\d{4}-\d{2}-\d{2}-', tender_id))
 
-    BROWSER_HEADERS = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/123.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-    }
+    # ── Крок 0: перевіряємо локальний кеш (БД) ───────────────────────────────
+    try:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute(
+            '''SELECT id, title, procuring_entity, amount, cpv, region,
+                      date_published, url
+               FROM tenders WHERE id = ?''',
+            (tender_id,)
+        )
+        row = c.fetchone()
+        conn.close()
+        if row:
+            log(f"   ✅ Знайдено в локальній БД")
+            return {
+                "id": row[0], "limited": False, "newTender": False,
+                "title": row[1] or "", "procuringEntity": row[2] or "",
+                "amount": row[3] or 0, "currency": "UAH",
+                "status": "active",
+                "datePublished": row[6] or "", "region": row[5] or "",
+                "locality": "", "cpv": row[4] or "", "cpvDescription": "",
+                "url": row[7] or prozorro_url,
+            }
+    except Exception as e:
+        log(f"   DB check error: {e}")
 
-    async def try_detail_by_hex(client, hex_id: str) -> dict:
-        """Fetch detail by internal hex UUID, return data dict or {}."""
+    async def fetch_detail(client, hex_id: str) -> dict:
+        """Повертає повний об'єкт тендера за внутрішнім hex UUID або {}."""
         try:
             r = await client.get(f"{PROZORRO_API}/tenders/{hex_id}", timeout=10.0)
             if r.status_code == 200:
@@ -602,98 +618,68 @@ async def get_tender_by_id(tender_id: str):
         return {}
 
     try:
-        async with httpx.AsyncClient(
-            timeout=20.0,
-            headers=BROWSER_HEADERS,
-            follow_redirects=True,
-        ) as client:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
 
-            # ── Спроба 1: прямий запит (працює для внутрішніх hex-ID) ────────
+            # ── Крок 1: прямий запит для внутрішніх hex UUID ─────────────────
             if not is_ua_id:
-                log(f"   Спроба 1 (hex direct)...")
-                data = await try_detail_by_hex(client, tender_id)
+                log(f"   Крок 1 (hex direct)...")
+                data = await fetch_detail(client, tender_id)
                 if data:
-                    log(f"   ✅ Спроба 1 → знайдено")
+                    log(f"   ✅ Знайдено за hex UUID")
                     return _build_tender_response(tender_id, data, prozorro_url)
 
-            # ── Спроба 2: public API ?tenderID= з перевіркою ─────────────────
-            # Параметр іноді ігнорується API, але якщо opt_fields повертає
-            # поле tenderID — перевіряємо точний збіг перед detail-запитом.
-            try:
-                r2 = await client.get(
-                    f"{PROZORRO_API}/tenders",
-                    params={"tenderID": tender_id,
-                            "opt_fields": "id,tenderID", "limit": 5},
-                    timeout=10.0,
-                )
-                log(f"   Спроба 2 (public API tenderID) → {r2.status_code}")
-                if r2.status_code == 200:
-                    for item in r2.json().get("data", []):
-                        if item.get("tenderID") == tender_id:
-                            log(f"   ✅ Знайдено через public API tenderID!")
-                            data = await try_detail_by_hex(client, item["id"])
-                            if data:
-                                return _build_tender_response(tender_id, data, prozorro_url)
-            except Exception as e:
-                log(f"   Спроба 2 error: {e}")
-
-            # ── Спроба 3: prozorro.gov.ua internal JSON API ───────────────────
-            # Сайт prozorro.gov.ua має власний бекенд, який може підтримувати
-            # пошук за UA-номером. Пробуємо кілька потенційних ендпоінтів.
-            for url in [
-                f"https://prozorro.gov.ua/api/tenders/{tender_id}",
-                f"https://prozorro.gov.ua/api/tender/{tender_id}",
-                f"https://prozorro.gov.ua/api/tenders?tenderID={tender_id}&limit=1",
-            ]:
-                try:
-                    r = await client.get(
-                        url,
-                        headers={**BROWSER_HEADERS, "Accept": "application/json"},
-                        timeout=8.0,
-                    )
-                    log(f"   Спроба 3 {url} → {r.status_code}, "
-                        f"ct={r.headers.get('content-type','?')[:40]}")
-                    if r.status_code == 200 and "json" in r.headers.get("content-type", ""):
-                        jdata = r.json()
-                        # Відповідь може бути {data: {...}} або одразу тендером
-                        candidates = [jdata.get("data", jdata)]
-                        if isinstance(jdata.get("data"), list):
-                            candidates = jdata["data"]
-                        for td in candidates:
-                            if isinstance(td, dict) and td.get("tenderID") == tender_id:
-                                log(f"   ✅ Знайдено через prozorro.gov.ua API!")
-                                return _build_tender_response(tender_id, td, prozorro_url)
-                        log(f"   JSON preview: {str(jdata)[:150]}")
-                except Exception as e:
-                    log(f"   Спроба 3 {url} error: {e}")
-
-            # ── Спроба 4: web scrape з повними browser-заголовками ────────────
-            # prozorro.gov.ua — це JS SPA (818-символьна оболонка без SSR),
-            # UUID у HTML не буде, але логуємо вміст для діагностики.
-            try:
-                rw = await client.get(
-                    f"https://prozorro.gov.ua/uk/tender/{tender_id}",
-                    headers={**BROWSER_HEADERS,
-                             "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"},
-                    timeout=12.0,
-                )
-                log(f"   Спроба 4 (web) → {rw.status_code}, {len(rw.text)} chars")
-                log(f"   HTML[0:500]: {rw.text[:500]!r}")
-                if rw.status_code == 200:
-                    hex_ids = list(dict.fromkeys(
-                        re.findall(r'\b([0-9a-f]{32})\b', rw.text)
-                    ))
-                    log(f"   UUID-кандидатів: {len(hex_ids)}")
-                    for hex_id in hex_ids[:15]:
-                        data = await try_detail_by_hex(client, hex_id)
-                        if data and data.get("tenderID") == tender_id:
-                            log(f"   ✅ Знайдено через web UUID={hex_id}!")
-                            return _build_tender_response(tender_id, data, prozorro_url)
-            except Exception as e:
-                log(f"   Спроба 4 error: {e}")
+            # ── Крок 2: «Пошуковий міст» — офіційний індекс tenderID ─────────
+            #
+            # GET /tenders?tenderID={ua_number} — реєстр Prozorro індексує
+            # тендери за полем tenderID. Витягуємо hex UUID з відповіді,
+            # потім отримуємо повний об'єкт і верифікуємо збіг tenderID.
+            # Верифікація критична: якщо фільтр API не спрацював і повернув
+            # чужий тендер — відхиляємо (не показуємо неправильні дані).
+            log(f"   Крок 2 (tenderID index)...")
+            r_list = await client.get(
+                f"{PROZORRO_API}/tenders",
+                params={"tenderID": tender_id, "opt_fields": "id", "limit": 10},
+                timeout=10.0,
+            )
+            log(f"   → {r_list.status_code}")
+            if r_list.status_code == 200:
+                candidates = r_list.json().get("data", [])
+                log(f"   Кандидатів у списку: {len(candidates)}")
+                for item in candidates:
+                    hex_id = item.get("id", "")
+                    if not hex_id:
+                        continue
+                    data = await fetch_detail(client, hex_id)
+                    if not data:
+                        continue
+                    actual_tid = data.get("tenderID", "")
+                    if actual_tid == tender_id:
+                        log(f"   ✅ tenderID збігається! UUID={hex_id}")
+                        # ── Крок 3: зберігаємо в кеш (БД) ───────────────────
+                        try:
+                            items_list = data.get("items", [])
+                            addr       = (data.get("procuringEntity") or {}).get("address") or {}
+                            date_pub   = get_tender_date(data)
+                            save_tender_now(0, {
+                                "id":              tender_id,
+                                "title":           data.get("title", ""),
+                                "procuringEntity": (data.get("procuringEntity") or {}).get("name", ""),
+                                "amount":          (data.get("value") or {}).get("amount", 0),
+                                "cpv":             (items_list[0].get("classification") or {}).get("id", "") if items_list else "",
+                                "region":          addr.get("region", ""),
+                                "datePublished":   date_pub,
+                                "url":             prozorro_url,
+                            })
+                            log(f"   💾 Збережено в кеш БД")
+                        except Exception as e:
+                            log(f"   Кеш error (non-fatal): {e}")
+                        return _build_tender_response(tender_id, data, prozorro_url)
+                    else:
+                        log(f"   ❌ Mismatch: API={actual_tid!r} ≠ {tender_id!r} — фільтр не спрацював")
+                        break  # якщо перший результат неправильний — далі немає сенсу
 
             # ── Fallback ──────────────────────────────────────────────────────
-            log(f"   ⚠️ Усі спроби вичерпано — повертаємо посилання")
+            log(f"   ⚠️ Не знайдено — повертаємо посилання")
             return {**fallback, "newTender": False}
 
     except Exception as e:
