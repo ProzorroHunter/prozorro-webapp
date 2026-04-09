@@ -569,7 +569,7 @@ def _build_tender_response(tender_id: str, data: dict, prozorro_url: str, limite
 
 @app.get("/api/tender/{tender_id}")
 async def get_tender_by_id(tender_id: str):
-    import re
+    import re, json as _json
     log(f"\n🔍 ПОШУК ТЕНДЕРА: {tender_id}")
     prozorro_url = f"https://prozorro.gov.ua/tender/{tender_id}"
     fallback = {
@@ -581,46 +581,66 @@ async def get_tender_by_id(tender_id: str):
     }
     is_ua_id = bool(re.match(r'^UA-\d{4}-\d{2}-\d{2}-', tender_id))
 
+    async def try_detail_by_hex(client, hex_id: str) -> dict:
+        """Fetch detail by internal hex UUID, return data dict or {}."""
+        try:
+            r = await client.get(f"{PROZORRO_API}/tenders/{hex_id}", timeout=10.0)
+            if r.status_code == 200:
+                return r.json().get("data") or {}
+        except Exception:
+            pass
+        return {}
+
     try:
-        async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0 ProzorroHunter/1.0"}) as client:
+        async with httpx.AsyncClient(
+            timeout=20.0,
+            headers={"User-Agent": "Mozilla/5.0 ProzorroHunter/1.0"},
+            follow_redirects=True,
+        ) as client:
 
-            # Спроба 1: прямий запит (працює тільки для внутрішніх hex-ID)
+            # ── Спроба 1: прямий запит (працює для внутрішніх hex-ID) ────────
             if not is_ua_id:
-                r1 = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
-                log(f"   Спроба 1 (hex) → {r1.status_code}")
-                if r1.status_code == 200:
-                    return _build_tender_response(tender_id, r1.json().get("data", {}), prozorro_url)
+                log(f"   Спроба 1 (hex direct)...")
+                data = await try_detail_by_hex(client, tender_id)
+                if data:
+                    log(f"   ✅ Спроба 1 → знайдено")
+                    return _build_tender_response(tender_id, data, prozorro_url)
 
-            # Спроба 2: пошук по людино-читабельному номеру UA-YYYY-MM-DD-...
-            # ?tenderID= фільтрує список і повертає внутрішній UUID у полі "id".
-            # ВАЖЛИВО: поле tenderID НЕ повертається в list-відповіді (тільки в detail),
-            # тому перевіряти item.get("tenderID") == tender_id не можна —
-            # просто беремо перший результат і робимо detail-запит.
-            r2 = await client.get(
-                f"{PROZORRO_API}/tenders",
-                params={"tenderID": tender_id, "limit": 1,
-                        "opt_fields": "id,title,status"}
-            )
-            log(f"   Спроба 2 (tenderID param) → {r2.status_code}")
-            if r2.status_code == 200:
-                lst = r2.json().get("data", [])
-                if lst:
-                    internal_id = lst[0].get("id", "")
-                    log(f"   Знайдено internal_id: {internal_id}")
-                    if internal_id:
-                        r3 = await client.get(f"{PROZORRO_API}/tenders/{internal_id}")
-                        log(f"   Спроба 3 (detail) → {r3.status_code}")
-                        if r3.status_code == 200:
-                            return _build_tender_response(tender_id, r3.json().get("data", {}), prozorro_url)
-                    # detail не вдався — повертаємо хоча б те що маємо
-                    t = lst[0]
-                    return {**fallback, "limited": True,
-                            "title": t.get("title", ""),
-                            "status": t.get("status", "unknown")}
+            # ── Спроба 2: витягуємо UUID зі сторінки prozorro.gov.ua ─────────
+            # Prozorro public API не підтримує фільтрацію по ?tenderID=
+            # (параметр ігнорується і повертається довільний тендер).
+            # Натомість prozorro.gov.ua /uk/tender/{UA-id} знає внутрішній UUID
+            # і вбудовує його в HTML сторінки (Next.js __NEXT_DATA__ тощо).
+            for web_url in [
+                f"https://prozorro.gov.ua/uk/tender/{tender_id}",
+                f"https://prozorro.gov.ua/tender/{tender_id}",
+            ]:
+                try:
+                    log(f"   Спроба 2 (web scrape): {web_url}")
+                    rw = await client.get(web_url, timeout=12.0)
+                    log(f"   → HTTP {rw.status_code}, {len(rw.text)} chars")
+                    if rw.status_code != 200:
+                        continue
 
-            fallback["newTender"] = True
-            log(f"   Тендер не знайдено — повертаємо fallback")
-            return fallback
+                    # Шукаємо всі 32-символьні hex-рядки (формат internal UUID)
+                    hex_ids = list(dict.fromkeys(
+                        re.findall(r'\b([0-9a-f]{32})\b', rw.text)
+                    ))
+                    log(f"   Знайдено {len(hex_ids)} UUID-кандидатів у HTML")
+
+                    for hex_id in hex_ids[:15]:
+                        data = await try_detail_by_hex(client, hex_id)
+                        if data and data.get("tenderID") == tender_id:
+                            log(f"   ✅ Знайдено через web scrape! UUID={hex_id}")
+                            return _build_tender_response(tender_id, data, prozorro_url)
+
+                except Exception as e:
+                    log(f"   Web scrape помилка: {e}")
+
+            # ── Fallback: повертаємо посилання без даних ──────────────────────
+            log(f"   ⚠️ Не вдалося знайти тендер — повертаємо посилання")
+            return {**fallback, "newTender": False}
+
     except Exception as e:
         log(f"❌ EXCEPTION get_tender: {type(e).__name__}: {e}")
         return fallback
