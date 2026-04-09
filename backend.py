@@ -581,6 +581,16 @@ async def get_tender_by_id(tender_id: str):
     }
     is_ua_id = bool(re.match(r'^UA-\d{4}-\d{2}-\d{2}-', tender_id))
 
+    BROWSER_HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+    }
+
     async def try_detail_by_hex(client, hex_id: str) -> dict:
         """Fetch detail by internal hex UUID, return data dict or {}."""
         try:
@@ -594,7 +604,7 @@ async def get_tender_by_id(tender_id: str):
     try:
         async with httpx.AsyncClient(
             timeout=20.0,
-            headers={"User-Agent": "Mozilla/5.0 ProzorroHunter/1.0"},
+            headers=BROWSER_HEADERS,
             follow_redirects=True,
         ) as client:
 
@@ -606,39 +616,84 @@ async def get_tender_by_id(tender_id: str):
                     log(f"   ✅ Спроба 1 → знайдено")
                     return _build_tender_response(tender_id, data, prozorro_url)
 
-            # ── Спроба 2: витягуємо UUID зі сторінки prozorro.gov.ua ─────────
-            # Prozorro public API не підтримує фільтрацію по ?tenderID=
-            # (параметр ігнорується і повертається довільний тендер).
-            # Натомість prozorro.gov.ua /uk/tender/{UA-id} знає внутрішній UUID
-            # і вбудовує його в HTML сторінки (Next.js __NEXT_DATA__ тощо).
-            for web_url in [
-                f"https://prozorro.gov.ua/uk/tender/{tender_id}",
-                f"https://prozorro.gov.ua/tender/{tender_id}",
+            # ── Спроба 2: public API ?tenderID= з перевіркою ─────────────────
+            # Параметр іноді ігнорується API, але якщо opt_fields повертає
+            # поле tenderID — перевіряємо точний збіг перед detail-запитом.
+            try:
+                r2 = await client.get(
+                    f"{PROZORRO_API}/tenders",
+                    params={"tenderID": tender_id,
+                            "opt_fields": "id,tenderID", "limit": 5},
+                    timeout=10.0,
+                )
+                log(f"   Спроба 2 (public API tenderID) → {r2.status_code}")
+                if r2.status_code == 200:
+                    for item in r2.json().get("data", []):
+                        if item.get("tenderID") == tender_id:
+                            log(f"   ✅ Знайдено через public API tenderID!")
+                            data = await try_detail_by_hex(client, item["id"])
+                            if data:
+                                return _build_tender_response(tender_id, data, prozorro_url)
+            except Exception as e:
+                log(f"   Спроба 2 error: {e}")
+
+            # ── Спроба 3: prozorro.gov.ua internal JSON API ───────────────────
+            # Сайт prozorro.gov.ua має власний бекенд, який може підтримувати
+            # пошук за UA-номером. Пробуємо кілька потенційних ендпоінтів.
+            for url in [
+                f"https://prozorro.gov.ua/api/tenders/{tender_id}",
+                f"https://prozorro.gov.ua/api/tender/{tender_id}",
+                f"https://prozorro.gov.ua/api/tenders?tenderID={tender_id}&limit=1",
             ]:
                 try:
-                    log(f"   Спроба 2 (web scrape): {web_url}")
-                    rw = await client.get(web_url, timeout=12.0)
-                    log(f"   → HTTP {rw.status_code}, {len(rw.text)} chars")
-                    if rw.status_code != 200:
-                        continue
+                    r = await client.get(
+                        url,
+                        headers={**BROWSER_HEADERS, "Accept": "application/json"},
+                        timeout=8.0,
+                    )
+                    log(f"   Спроба 3 {url} → {r.status_code}, "
+                        f"ct={r.headers.get('content-type','?')[:40]}")
+                    if r.status_code == 200 and "json" in r.headers.get("content-type", ""):
+                        jdata = r.json()
+                        # Відповідь може бути {data: {...}} або одразу тендером
+                        candidates = [jdata.get("data", jdata)]
+                        if isinstance(jdata.get("data"), list):
+                            candidates = jdata["data"]
+                        for td in candidates:
+                            if isinstance(td, dict) and td.get("tenderID") == tender_id:
+                                log(f"   ✅ Знайдено через prozorro.gov.ua API!")
+                                return _build_tender_response(tender_id, td, prozorro_url)
+                        log(f"   JSON preview: {str(jdata)[:150]}")
+                except Exception as e:
+                    log(f"   Спроба 3 {url} error: {e}")
 
-                    # Шукаємо всі 32-символьні hex-рядки (формат internal UUID)
+            # ── Спроба 4: web scrape з повними browser-заголовками ────────────
+            # prozorro.gov.ua — це JS SPA (818-символьна оболонка без SSR),
+            # UUID у HTML не буде, але логуємо вміст для діагностики.
+            try:
+                rw = await client.get(
+                    f"https://prozorro.gov.ua/uk/tender/{tender_id}",
+                    headers={**BROWSER_HEADERS,
+                             "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"},
+                    timeout=12.0,
+                )
+                log(f"   Спроба 4 (web) → {rw.status_code}, {len(rw.text)} chars")
+                log(f"   HTML[0:500]: {rw.text[:500]!r}")
+                if rw.status_code == 200:
                     hex_ids = list(dict.fromkeys(
                         re.findall(r'\b([0-9a-f]{32})\b', rw.text)
                     ))
-                    log(f"   Знайдено {len(hex_ids)} UUID-кандидатів у HTML")
-
+                    log(f"   UUID-кандидатів: {len(hex_ids)}")
                     for hex_id in hex_ids[:15]:
                         data = await try_detail_by_hex(client, hex_id)
                         if data and data.get("tenderID") == tender_id:
-                            log(f"   ✅ Знайдено через web scrape! UUID={hex_id}")
+                            log(f"   ✅ Знайдено через web UUID={hex_id}!")
                             return _build_tender_response(tender_id, data, prozorro_url)
+            except Exception as e:
+                log(f"   Спроба 4 error: {e}")
 
-                except Exception as e:
-                    log(f"   Web scrape помилка: {e}")
-
-            # ── Fallback: повертаємо посилання без даних ──────────────────────
-            log(f"   ⚠️ Не вдалося знайти тендер — повертаємо посилання")
+            # ── Fallback ──────────────────────────────────────────────────────
+            log(f"   ⚠️ Усі спроби вичерпано — повертаємо посилання")
             return {**fallback, "newTender": False}
 
     except Exception as e:
