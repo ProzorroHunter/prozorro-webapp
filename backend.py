@@ -92,87 +92,83 @@ def get_tender_date(dd: dict) -> str:
 
 def _build_tender_response(tender_id: str, data: dict, url: str) -> dict:
     pe = data.get("procuringEntity", {})
-    addr = pe.get("address", {})
     val = data.get("value", {})
     items = data.get("items", [])
     clf = items[0].get("classification", {}) if items else {}
+    
+    # Если год в дате публикации слишком старый, а в ID — 2026
+    pub_date = get_tender_date(data)
+    title = data.get("title", "Тендер знайдено")
+    if "2026" in tender_id and "201" in pub_date:
+        title = "⚠️ ТЕНДЕР 2026 (Дані завантажуються...)"
+
     return {
         "id": tender_id, "limited": False, "newTender": False,
-        "title": data.get("title", "Тендер знайдено"),
+        "title": title,
         "procuringEntity": pe.get("name", "Дані Prozorro"),
         "amount": val.get("amount", 0), "currency": val.get("currency", "UAH"),
-        "status": data.get("status", "active"), "datePublished": get_tender_date(data),
-        "region": addr.get("region", ""), "cpv": clf.get("id", ""), "url": url
+        "status": data.get("status", "active"), "datePublished": pub_date,
+        "region": pe.get("address", {}).get("region", ""), "cpv": clf.get("id", ""), "url": url
     }
 
 @app.get("/api/tender/{tender_id}")
 async def get_tender_by_id(tender_id: str):
-    # Очистка входных данных (бывает юзер копирует номер с пробелом)
     tender_id = tender_id.strip()
-    log(f"🔍 ЗАПИТ ТЕНДЕРА: {tender_id}")
+    log(f"🔍 ПОШУК ТЕНДЕРА: {tender_id}")
     prozorro_url = f"https://prozorro.gov.ua/tender/{tender_id}"
-    
-    # Регулярка для UA-номера
     is_ua_id = bool(re.match(r'^UA-\d{4}-\d{2}-\d{2}-', tender_id))
 
-    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
         hex_id = tender_id
         
         if is_ua_id:
-            # 1. Сначала пробуем найти внутренний HEX ID через поиск
+            # СТРАТЕГИЯ: Сначала смотрим в ленте НОВЫХ тендеров (descending)
+            # Это исключает попадание на старые архивные записи с похожими номерами
             try:
-                r_search = await client.get(f"{PROZORRO_API}/tenders", params={"tenderID": tender_id, "opt_fields": "id"})
-                cands = r_search.json().get("data", [])
-                if cands:
-                    hex_id = cands[0]["id"]
-                else:
-                    # 2. Если поиск не нашел, сканируем последние 100 тендеров (для самых новых)
-                    r_recent = await client.get(f"{PROZORRO_API}/tenders", params={"limit": 100, "descending": 1, "opt_fields": "id,tenderID"})
+                r_recent = await client.get(f"{PROZORRO_API}/tenders", params={"limit": 100, "descending": 1, "opt_fields": "id,tenderID"})
+                if r_recent.status_code == 200:
                     recent_data = r_recent.json().get("data", [])
-                    matches = [i for i in recent_data if i.get("tenderID") == tender_id]
-                    if matches:
-                        hex_id = matches[0]["id"]
+                    match = next((i for i in recent_data if i.get("tenderID") == tender_id), None)
+                    if match:
+                        hex_id = match["id"]
+                        log(f"   🎯 Знайдено в новому потоці: {hex_id}")
                     else:
-                        # Если совсем нет в API — даем просто ссылку
-                        return {"id": tender_id, "limited": True, "newTender": True, "url": prozorro_url, "title": "Тендер знайдено", "status": "active"}
+                        # Если в последних 100 нет, пробуем целевой поиск, но фильтруем по дате
+                        r_search = await client.get(f"{PROZORRO_API}/tenders", params={"tenderID": tender_id, "opt_fields": "id,dateModified"})
+                        cands = r_search.json().get("data", [])
+                        if cands:
+                            # Берем самый свежий по дате модификации
+                            cands.sort(key=lambda x: x.get("dateModified", ""), reverse=True)
+                            hex_id = cands[0]["id"]
             except Exception as e:
-                log(f"   ⚠️ Помилка пошуку ID: {e}")
+                log(f"   ⚠️ Помилка API: {e}")
 
-        # 3. Запрос деталей по HEX ID
-        try:
-            r_det = await client.get(f"{PROZORRO_API}/tenders/{hex_id}")
-            if r_det.status_code == 200:
-                data = r_det.json().get("data", {})
-                return _build_tender_response(tender_id, data, prozorro_url)
-        except Exception as e:
-            log(f"   ⚠️ Помилка деталей: {e}")
+        # Запрос деталей
+        r_det = await client.get(f"{PROZORRO_API}/tenders/{hex_id}")
+        if r_det.status_code == 200:
+            return _build_tender_response(tender_id, r_det.json().get("data", {}), prozorro_url)
 
-    # Fallback
-    return {"id": tender_id, "limited": True, "url": prozorro_url, "title": "Тендер на Prozorro", "status": "active"}
+    return {"id": tender_id, "limited": True, "url": prozorro_url, "title": "Тендер знайдено на Prozorro", "status": "active"}
 
 @app.get("/api/stats")
 async def get_stats():
-    conn = get_conn()
-    c = conn.cursor()
-    
-    # Всего тендеров
-    c.execute('SELECT COUNT(*) FROM tenders')
-    total = c.fetchone()[0]
-    
-    # Сегодня (учитываем формат даты в базе)
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    if USE_PG:
-        c.execute("SELECT COUNT(*) FROM tenders WHERE date_published::text LIKE %s", (f"{today_str}%",))
-    else:
-        c.execute("SELECT COUNT(*) FROM tenders WHERE date_published LIKE ?", (f"{today_str}%",))
-    today = c.fetchone()[0]
-    
-    # Активные фильтры
-    c.execute('SELECT COUNT(*) FROM filters WHERE is_active = TRUE')
-    active_filters = c.fetchone()[0]
-    
-    conn.close()
-    return {"total": total, "today": today, "active": active_filters}
+    try:
+        conn = get_conn(); c = conn.cursor()
+        c.execute('SELECT COUNT(*) FROM tenders'); total = c.fetchone()[0]
+        
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        if USE_PG:
+            c.execute("SELECT COUNT(*) FROM tenders WHERE CAST(date_published AS TEXT) LIKE %s", (f"{today_str}%",))
+        else:
+            c.execute("SELECT COUNT(*) FROM tenders WHERE date_published LIKE ?", (f"{today_str}%",))
+        today = c.fetchone()[0]
+        
+        c.execute('SELECT COUNT(*) FROM filters WHERE is_active = TRUE'); active = c.fetchone()[0]
+        conn.close()
+        return {"total": total, "today": today, "active": active}
+    except Exception as e:
+        log(f"Stats error: {e}")
+        return {"total": 0, "today": 0, "active": 0}
 
 @app.get("/api/filters")
 async def get_filters():
@@ -205,7 +201,6 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
-
 
 
 
