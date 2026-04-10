@@ -32,13 +32,10 @@ _search_lock     = asyncio.Lock()
 _active_searches: set = set()   # filter IDs зараз в пошуку
 _queued_searches: set = set()   # filter IDs в черзі (чекають lock)
 
-# DATABASE_URL — рядок підключення PostgreSQL (для Render/Neon).
-# Якщо не задано — використовується локальний SQLite файл.
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 DB_PATH = os.getenv("DB_PATH", "prozorro.db")
 USE_PG = bool(DATABASE_URL and psycopg2)
 
-# Плейсхолдер параметрів: %s для PostgreSQL, ? для SQLite
 P = "%s" if USE_PG else "?"
 
 
@@ -140,7 +137,6 @@ class FilterCreate(BaseModel):
 PROZORRO_API = "https://public-api.prozorro.gov.ua/api/2.5"
 
 
-# ── Простий стемер для українських слів ─────────────────────────────────────
 _UK_SUFFIXES = tuple(sorted([
     'ськими', 'зьких', 'зьким', 'ськими', 'ському', 'ській',
     'ними', 'ому', 'ами', 'ями', 'ків', 'ань', 'ими',
@@ -532,7 +528,7 @@ async def get_tender_by_id(tender_id: str):
     log(f"\n🔍 ПОШУК ТЕНДЕРА: {tender_id}")
     prozorro_url = f"https://prozorro.gov.ua/tender/{tender_id}"
     
-    # Fallback с сообщением о том, что тендер не найден в API
+    # Fallback с понятным сообщением
     fallback = {
         "id": tender_id, 
         "limited": True, 
@@ -548,7 +544,7 @@ async def get_tender_by_id(tender_id: str):
         "cpv": "", 
         "cpvDescription": "", 
         "url": prozorro_url,
-        "message": "Тендер існує на сайті Prozorro, але недоступний через Public API (можливо, обмежений доступ або тендер ще не проіндексовано). Перейдіть на сайт для перегляду деталей."
+        "message": "Тендер існує на сайті Prozorro, але недоступний через Public API (можливо, тендер ще не проіндексовано або має обмежений доступ). Перейдіть на сайт для перегляду деталей."
     }
     
     is_ua_id = bool(re.match(r'^UA-\d{4}-\d{2}-\d{2}-', tender_id))
@@ -609,25 +605,27 @@ async def get_tender_by_id(tender_id: str):
             # ── Крок 2: Пошук через API /tenders з точним tenderID ─────────────
             log(f"   Крок 2 (пошук по tenderID)...")
             
-            for attempt in range(3):
+            # Пробуем разные типы закупок
+            procurement_types = [None, "belowThreshold", "aboveThresholdUA", "aboveThresholdEU", "negotiation", "reporting"]
+            
+            for proc_type in procurement_types:
                 try:
-                    search_timeout = 10.0 + attempt * 5.0
+                    params = {
+                        "tenderID": tender_id,
+                        "opt_fields": "id,tenderID,dateModified", 
+                        "limit": 100
+                    }
+                    if proc_type:
+                        params["procurementMethodType"] = proc_type
                     
                     r_list = await client.get(
                         f"{PROZORRO_API}/tenders",
-                        params={
-                            "tenderID": tender_id,
-                            "opt_fields": "id,tenderID,dateModified", 
-                            "limit": 100
-                        },
-                        timeout=search_timeout,
+                        params=params,
+                        timeout=15.0,
                     )
-                    
-                    log(f"   → статус {r_list.status_code}")
                     
                     if r_list.status_code == 200:
                         candidates = r_list.json().get("data", [])
-                        log(f"   Кандидатів: {len(candidates)}")
                         
                         # Шукаємо ТОЧНИЙ збіг
                         for item in candidates:
@@ -635,7 +633,7 @@ async def get_tender_by_id(tender_id: str):
                             hex_id = item.get("id", "")
                             
                             if item_tid == tender_id and hex_id:
-                                log(f"   ✅ Точний збіг! {hex_id}")
+                                log(f"   ✅ Знайдено в {proc_type or 'default'}: {hex_id}")
                                 data = await fetch_detail(client, hex_id, timeout=15.0)
                                 if data:
                                     # Зберігаємо в кеш
@@ -656,25 +654,18 @@ async def get_tender_by_id(tender_id: str):
                                     except Exception as e:
                                         log(f"   Кеш error: {e}")
                                     return _build_tender_response(tender_id, data, prozorro_url)
-                        
-                        log(f"   ⚠️ Немає точного збігу")
-                                
+                                    
                 except Exception as e:
-                    log(f"   → помилка спроби {attempt+1}: {e}")
-                
-                if attempt < 2:
-                    await asyncio.sleep(1.0)
+                    log(f"   → помилка {proc_type}: {e}")
 
-            # ── Крок 3: Сканування останніх 2000 тендерів ────────────────────
-            # Для НОВИХ тендерів, які ще не проіндексовані
-            log(f"   Крок 3 (сканування останніх 2000 тендерів)...")
+            # ── Крок 3: Сканування останніх 5000 тендерів ────────────────────
+            log(f"   Крок 3 (сканування останніх 5000 тендерів)...")
             
             try:
-                # Скануємо з пагінацією
                 offset = None
-                found_items = []
+                checked = 0
                 
-                for scan_page in range(20):  # Максимум 20 сторінок по 100 = 2000
+                for scan_page in range(50):  # Максимум 50 сторінок по 100 = 5000
                     params = {
                         "descending": "1",
                         "limit": "100",
@@ -694,6 +685,7 @@ async def get_tender_by_id(tender_id: str):
                         items = recent_data.get("data", [])
                         
                         for item in items:
+                            checked += 1
                             if item.get("tenderID") == tender_id:
                                 hex_id = item.get("id", "")
                                 log(f"   ✅ Знайдено в скануванні (стор. {scan_page+1}): {hex_id}")
@@ -726,30 +718,19 @@ async def get_tender_by_id(tender_id: str):
                         
                         if not offset or len(items) == 0:
                             break
+                        
+                        # Зупиняємося якщо перевірили достатньо
+                        if checked >= 5000:
+                            break
                     else:
                         break
                 
-                log(f"   ❌ Не знайдено в скануванні (перевірено ~2000 тендерів)")
+                log(f"   ❌ Не знайдено в скануванні (перевірено ~{checked} тендерів)")
                     
             except Exception as e:
                 log(f"   → помилка сканування: {e}")
 
-            # ── Крок 4: Спроба отримати через CDB (центральна база даних) ────
-            log(f"   Крок 4 (CDB запит)...")
-            try:
-                r_cdb = await client.get(
-                    f"https://public-api.prozorro.gov.ua/api/2.5/tenders/{tender_id}",
-                    timeout=15.0,
-                )
-                if r_cdb.status_code == 200:
-                    data = r_cdb.json().get("data")
-                    if data:
-                        log(f"   ✅ Знайдено в CDB!")
-                        return _build_tender_response(tender_id, data, prozorro_url)
-            except Exception as e:
-                log(f"   → CDB недоступний: {e}")
-
-            # ── Крок 5: Fallback з посиланням ─────────────────────────────────
+            # ── Крок 4: Fallback ─────────────────────────────────────────────
             log(f"   ⚠️ Всі методи вичерпано — повертаємо fallback")
             return fallback
 
