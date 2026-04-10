@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 import sqlite3
 import os
 import traceback
-from urllib.parse import quote
+import re
 
 try:
     import psycopg2
@@ -141,7 +141,6 @@ PROZORRO_API = "https://public-api.prozorro.gov.ua/api/2.5"
 
 
 # ── Простий стемер для українських слів ─────────────────────────────────────
-# Дозволяє знаходити "ноутбук" при запиті "ноутбуки" і навпаки.
 _UK_SUFFIXES = tuple(sorted([
     'ськими', 'зьких', 'зьким', 'ськими', 'ському', 'ській',
     'ними', 'ому', 'ами', 'ями', 'ків', 'ань', 'ими',
@@ -152,7 +151,6 @@ _UK_SUFFIXES = tuple(sorted([
 
 
 def uk_stem(word: str) -> str:
-    """Видаляє типове українське закінчення → нормалізований корінь."""
     for suffix in _UK_SUFFIXES:
         if word.endswith(suffix) and len(word) - len(suffix) >= 3:
             return word[:-len(suffix)]
@@ -169,16 +167,12 @@ def make_kw_list(keywords: Optional[str]):
             continue
         result.append(k)
         stem = uk_stem(k)
-        if stem != k:          # додаємо корінь для відмінкових форм
+        if stem != k:
             result.append(stem)
-    return list(dict.fromkeys(result))  # унікальні, зберігаємо порядок
+    return list(dict.fromkeys(result))
 
 
 def kw_in_text(kw: str, text: str) -> bool:
-    """Перевірка з морфологічною толерантністю.
-    'ноутбуки' знайде 'ноутбук', 'комп'ютерів' знайде 'комп'ютер' і т.д.
-    Відрізає до 3 символів з кінця, залишаючи мінімум 4 символи стему.
-    """
     if kw in text:
         return True
     for trim in range(1, 4):
@@ -187,11 +181,6 @@ def kw_in_text(kw: str, text: str) -> bool:
                 return True
     return False
 
-
-# ── Таблиця відповідності: область ↔ місто ───────────────────────────────────
-# Prozorro зберігає тендери міста Харків як region="місто Харків",
-# а тендери Харківської ОБЛАСТІ як region="Харківська область".
-# Ця таблиця дозволяє фільтру "Харківська область" знаходити обидва типи.
 
 OBLAST_ALIASES: dict[str, list[str]] = {
     "харківська":       ["харків",            "місто харків"],
@@ -220,7 +209,6 @@ OBLAST_ALIASES: dict[str, list[str]] = {
     "волинська":        ["луцьк",             "місто луцьк"],
 }
 
-# Зворотня: місто → область (для пошуку по місту — знаходить і область)
 CITY_TO_OBLAST: dict[str, str] = {}
 for oblast_key, cities in OBLAST_ALIASES.items():
     for city in cities:
@@ -228,24 +216,14 @@ for oblast_key, cities in OBLAST_ALIASES.items():
 
 
 def region_matches(searched: str, t_region: str, t_locality: str) -> bool:
-    """
-    Гнучкий матчинг регіону з урахуванням того що Prozorro зберігає:
-      - Тендери великих міст: region="місто Харків"
-      - Тендери решти області: region="Харківська область"
-
-    Фільтр "Харківська область" знаходить обидва типи.
-    Фільтр "Харків" (місто) теж знаходить обидва типи.
-    """
     s  = searched.lower().strip()
     tr = t_region.lower().strip()
     tl = t_locality.lower().strip()
     full_address = f"{tr} {tl}".strip()
 
-    # 1. Пряме входження
     if s in full_address:
         return True
 
-    # Нормалізована версія (без "область", "місто", "м.")
     def norm(r: str) -> str:
         return (r.replace(" область", "").replace("область", "")
                   .replace("місто ", "").replace("м. ", "")
@@ -254,23 +232,18 @@ def region_matches(searched: str, t_region: str, t_locality: str) -> bool:
     sn       = norm(s)
     full_n   = norm(full_address)
 
-    # 2. Нормалізоване входження
     if sn and sn in full_n:
         return True
     if norm(tr) and norm(tr) in sn:
         return True
 
-    # 3. Oblast → City aliases (головний виправлений баг)
-    #    "Харківська область" → шукаємо "харків" у повній адресі
     for oblast_key, city_list in OBLAST_ALIASES.items():
-        if oblast_key in sn:                    # шукаємо по "харківська"
+        if oblast_key in sn:
             for city in city_list:
                 if city in full_address or city in full_n:
                     return True
             break
 
-    # 4. City → Oblast (зворотній)
-    #    "Харків" → перевіряємо чи адреса містить "харківська"
     for city_key, oblast_key in CITY_TO_OBLAST.items():
         if city_key == sn or sn in city_key:
             if oblast_key in full_n or oblast_key in norm(tr):
@@ -280,7 +253,6 @@ def region_matches(searched: str, t_region: str, t_locality: str) -> bool:
 
 
 def get_tender_date(dd: dict) -> str:
-    """Повертає найкращу дату публікації тендера з кількох можливих полів API."""
     return (dd.get("datePublished")
             or dd.get("date")
             or dd.get("tenderPeriod", {}).get("startDate")
@@ -289,7 +261,6 @@ def get_tender_date(dd: dict) -> str:
 
 
 def save_tender_now(filter_id: int, tender: dict) -> bool:
-    """Зберігає тендер в БД одразу. Повертає True якщо новий."""
     try:
         conn = get_conn()
         c = conn.cursor()
@@ -384,13 +355,11 @@ async def search_and_save(filter_id: int, keywords=None, cpv=None, region=None,
                         reached_boundary = True
                         break
 
-                    # Pre-filter по title (з морфологічною толерантністю)
                     if list_title and kw_list:
                         lt_lower = list_title.lower()
                         if not any(kw_in_text(kw, lt_lower) for kw in kw_list):
                             continue
 
-                    # Detail-запит
                     total_details += 1
                     try:
                         dr = await client.get(f"{PROZORRO_API}/tenders/{tender_id}")
@@ -436,7 +405,6 @@ async def search_and_save(filter_id: int, keywords=None, cpv=None, region=None,
                             break
 
                     else:
-                        # Детальне логування регіон-відмов — всі, без ліміту
                         if region and "Регіон" in result["reason"]:
                             region_rejects += 1
                             addr    = dd.get("procuringEntity", {}).get("address", {})
@@ -495,13 +463,9 @@ def check_filter_detailed(tender, keywords, cpv, region, procuring_entity,
 
     if procuring_entity:
         entity = tender.get("procuringEntity", {}).get("name", "").lower()
-        # Пошук по кожному слову окремо (Prozorro зберігає назви у різних форматах:
-        # великі літери, різний порядок слів, скорочення тощо).
-        # Слова коротші за 3 символи ігноруємо (прийменники, артиклі).
         search_words = [w for w in procuring_entity.lower().split() if len(w) >= 3]
         if search_words and not all(kw_in_text(w, entity) for w in search_words):
             return {"matches": False, "reason": f"Замовник не співпадає: шукали '{procuring_entity}', є '{entity[:80]}'"}
-        # Також перевіряємо identifier (ЄДРПОУ) якщо введено тільки цифри
         if procuring_entity.strip().isdigit():
             edrpou = tender.get("procuringEntity", {}).get("identifier", {}).get("id", "")
             if procuring_entity.strip() not in edrpou:
@@ -527,10 +491,6 @@ def check_filter_detailed(tender, keywords, cpv, region, procuring_entity,
     return {"matches": True, "reason": "OK"}
 
 
-# ══════════════════════════════════════════════════════
-#  ROUTES
-# ══════════════════════════════════════════════════════
-
 @app.get("/")
 async def root():
     return FileResponse('static/index.html')
@@ -541,7 +501,6 @@ async def health():
 
 
 def _build_tender_response(tender_id: str, data: dict, prozorro_url: str, limited: bool = False) -> dict:
-    # Безпечне розпакування — Prozorro API може повертати null для деяких полів
     items = data.get("items") or []
     pe    = data.get("procuringEntity") or {}
     addr  = pe.get("address") or {}
@@ -570,15 +529,13 @@ def _build_tender_response(tender_id: str, data: dict, prozorro_url: str, limite
 
 @app.get("/api/tender/{tender_id}")
 async def get_tender_by_id(tender_id: str):
-    import re
     log(f"\n🔍 ПОШУК ТЕНДЕРА: {tender_id}")
     prozorro_url = f"https://prozorro.gov.ua/tender/{tender_id}"
     
-    # Базовый fallback - минимальная информация
     fallback = {
         "id": tender_id, 
         "limited": True, 
-        "newTender": True,  # Предполагаем, что это новый тендер
+        "newTender": True,
         "title": "", 
         "procuringEntity": "", 
         "amount": 0,
@@ -622,7 +579,6 @@ async def get_tender_by_id(tender_id: str):
         log(f"   DB check error: {e}")
 
     async def fetch_detail(client, hex_id: str, timeout: float = 10.0) -> dict:
-        """Повертає повний об'єкт тендера за внутрішнім hex UUID або {}."""
         try:
             r = await client.get(f"{PROZORRO_API}/tenders/{hex_id}", timeout=timeout)
             if r.status_code == 200:
@@ -638,7 +594,6 @@ async def get_tender_by_id(tender_id: str):
         return {}
 
     try:
-        # Увеличиваем таймаут для всего клиента
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
 
             # ── Крок 1: прямий запит для внутрішніх hex UUID ─────────────────
@@ -648,22 +603,21 @@ async def get_tender_by_id(tender_id: str):
                 if data:
                     log(f"   ✅ Знайдено за hex UUID")
                     return _build_tender_response(tender_id, data, prozorro_url)
-                # Для hex ID нет смысла пробовать дальше - это уже прямой запрос
                 return fallback
 
-            # ── Крок 2: «Пошуковий міст» — офіційний індекс tenderID ─────────
-            # Пробуем несколько раз с увеличенным таймаутом
+            # ── Крок 2: Пошук через API /tenders з точним tenderID ─────────────
+            log(f"   Крок 2 (пошук по tenderID)...")
+            
             for attempt in range(3):
                 try:
-                    log(f"   Крок 2 (tenderID index), спроба {attempt+1}...")
-                    search_timeout = 10.0 + attempt * 5.0  # 10, 15, 20 сек
+                    search_timeout = 10.0 + attempt * 5.0
                     
                     r_list = await client.get(
                         f"{PROZORRO_API}/tenders",
                         params={
-                            "tenderID": tender_id, 
+                            "tenderID": tender_id,
                             "opt_fields": "id,tenderID,dateModified", 
-                            "limit": 20
+                            "limit": 100
                         },
                         timeout=search_timeout,
                     )
@@ -671,109 +625,73 @@ async def get_tender_by_id(tender_id: str):
                     log(f"   → статус {r_list.status_code}")
                     
                     if r_list.status_code == 200:
-                        body = r_list.json()
-                        candidates = body.get("data", [])
-                        log(f"   Кандидатів у списку: {len(candidates)}")
+                        candidates = r_list.json().get("data", [])
+                        log(f"   Кандидатів: {len(candidates)}")
                         
-                        # Проверяем каждого кандидата
+                        # Шукаємо ТОЧНИЙ збіг
                         for item in candidates:
+                            item_tid = item.get("tenderID", "")
                             hex_id = item.get("id", "")
-                            item_tender_id = item.get("tenderID", "")
                             
-                            if not hex_id:
-                                continue
-                                
-                            # Если в списке уже есть tenderID и он совпадает - отлично
-                            if item_tender_id == tender_id:
-                                log(f"   ✅ Знайдено в списку: {hex_id}")
+                            if item_tid == tender_id and hex_id:
+                                log(f"   ✅ Точний збіг! {hex_id}")
                                 data = await fetch_detail(client, hex_id, timeout=15.0)
                                 if data:
+                                    # Зберігаємо в кеш
+                                    try:
+                                        items_list = data.get("items", [])
+                                        addr = (data.get("procuringEntity") or {}).get("address") or {}
+                                        date_pub = get_tender_date(data)
+                                        save_tender_now(0, {
+                                            "id": tender_id,
+                                            "title": data.get("title", ""),
+                                            "procuringEntity": (data.get("procuringEntity") or {}).get("name", ""),
+                                            "amount": (data.get("value") or {}).get("amount", 0),
+                                            "cpv": (items_list[0].get("classification") or {}).get("id", "") if items_list else "",
+                                            "region": addr.get("region", ""),
+                                            "datePublished": date_pub,
+                                            "url": prozorro_url,
+                                        })
+                                    except Exception as e:
+                                        log(f"   Кеш error: {e}")
                                     return _build_tender_response(tender_id, data, prozorro_url)
-                            
-                            # Иначе получаем детали и проверяем
-                            data = await fetch_detail(client, hex_id, timeout=10.0)
-                            if not data:
-                                continue
+                        
+                        log(f"   ⚠️ Немає точного збігу")
                                 
-                            actual_tid = data.get("tenderID", "")
-                            if actual_tid == tender_id:
-                                log(f"   ✅ tenderID збігається! UUID={hex_id}")
-                                # Сохраняем в кеш
-                                try:
-                                    items_list = data.get("items", [])
-                                    addr = (data.get("procuringEntity") or {}).get("address") or {}
-                                    date_pub = get_tender_date(data)
-                                    save_tender_now(0, {
-                                        "id": tender_id,
-                                        "title": data.get("title", ""),
-                                        "procuringEntity": (data.get("procuringEntity") or {}).get("name", ""),
-                                        "amount": (data.get("value") or {}).get("amount", 0),
-                                        "cpv": (items_list[0].get("classification") or {}).get("id", "") if items_list else "",
-                                        "region": addr.get("region", ""),
-                                        "datePublished": date_pub,
-                                        "url": prozorro_url,
-                                    })
-                                    log(f"   💾 Збережено в кеш БД")
-                                except Exception as e:
-                                    log(f"   Кеш error (non-fatal): {e}")
-                                return _build_tender_response(tender_id, data, prozorro_url)
-                            else:
-                                log(f"   ❌ Mismatch: API={actual_tid!r} ≠ {tender_id!r}")
-                        
-                        # Если кандидаты есть, но ни один не подошел - это странно, 
-                        # но продолжим следующую попытку
-                        if candidates:
-                            log(f"   ⚠️ {len(candidates)} кандидатів, але жоден не підходить")
-                        else:
-                            log(f"   ⚠️ Порожній список кандидатів (тендер ще не проіндексовано?)")
-                            
-                    elif r_list.status_code == 404:
-                        log(f"   → індекс повернув 404")
-                    else:
-                        log(f"   → невідома відповідь: {r_list.text[:100]}")
-                        
-                except httpx.TimeoutException:
-                    log(f"   → timeout на спробі {attempt+1}")
                 except Exception as e:
-                    log(f"   → помилка на спробі {attempt+1}: {e}")
+                    log(f"   → помилка спроби {attempt+1}: {e}")
                 
-                # Небольшая задержка перед следующей попыткой
                 if attempt < 2:
                     await asyncio.sleep(1.0)
 
-            # ── Крок 3: Пошук через сканування останніх тендерів ─────────────
-            # Иногда API не индексирует tenderID сразу, но тендер уже в списке
-            log(f"   Крок 3 (сканування останніх 200 тендерів)...")
+            # ── Крок 3: Сканування останніх 1000 тендерів ────────────────────
+            # Для НОВИХ тендерів, які ще не проіндексовані
+            log(f"   Крок 3 (сканування останніх 1000 тендерів)...")
             
             try:
-                # Получаем последние 200 тендеров
                 r_recent = await client.get(
                     f"{PROZORRO_API}/tenders",
                     params={
                         "descending": "1",
-                        "limit": "200",
+                        "limit": "1000",
                         "opt_fields": "id,tenderID,title,status,dateModified"
                     },
-                    timeout=20.0,
+                    timeout=30.0,
                 )
                 
                 if r_recent.status_code == 200:
                     recent_data = r_recent.json().get("data", [])
-                    log(f"   Отримано {len(recent_data)} недавніх тендерів")
+                    log(f"   Отримано {len(recent_data)} тендерів")
                     
                     for item in recent_data:
-                        item_tid = item.get("tenderID", "")
-                        if item_tid == tender_id:
+                        if item.get("tenderID") == tender_id:
                             hex_id = item.get("id", "")
-                            log(f"   ✅ Знайдено в недавніх: {hex_id}")
+                            log(f"   ✅ Знайдено в скануванні: {hex_id}")
                             
-                            # Получаем полные детали
                             data = await fetch_detail(client, hex_id, timeout=15.0)
                             if data:
                                 return _build_tender_response(tender_id, data, prozorro_url)
                             else:
-                                # Если не получили детали, возвращаем хотя бы базовую инфу из списка
-                                log(f"   ⚠️ Немає деталей, повертаємо базову інформацію")
                                 return {
                                     "id": tender_id,
                                     "limited": True,
@@ -789,34 +707,29 @@ async def get_tender_by_id(tender_id: str):
                                     "cpv": "",
                                     "cpvDescription": "",
                                     "url": prozorro_url,
-                                    "message": "Знайдено в списку, але деталі недоступні через API"
                                 }
                     
-                    log(f"   ❌ Не знайдено в недавніх тендерах")
+                    log(f"   ❌ Не знайдено в скануванні")
                     
             except Exception as e:
                 log(f"   → помилка сканування: {e}")
 
-            # ── Крок 4: Прямий запит з форматом UA-XXXX ─────────────────────
-            # Иногда API принимает UA-ID как hex (странно, но пробуем)
-            log(f"   Крок 4 (прямий запит з UA-ID)...")
+            # ── Крок 4: Спроба отримати через CDB (центральна база даних) ────
+            log(f"   Крок 4 (CDB запит)...")
             try:
-                # Кодируем tender_id для URL
-                encoded_id = quote(tender_id, safe='')
-                r_direct = await client.get(
-                    f"{PROZORRO_API}/tenders/{encoded_id}",
+                r_cdb = await client.get(
+                    f"https://public-api.prozorro.gov.ua/api/2.5/tenders/{tender_id}",
                     timeout=15.0,
                 )
-                if r_direct.status_code == 200:
-                    data = r_direct.json().get("data")
+                if r_cdb.status_code == 200:
+                    data = r_cdb.json().get("data")
                     if data:
-                        log(f"   ✅ Прямий запит успішний!")
+                        log(f"   ✅ Знайдено в CDB!")
                         return _build_tender_response(tender_id, data, prozorro_url)
             except Exception as e:
-                log(f"   → не вдалося: {e}")
+                log(f"   → CDB недоступний: {e}")
 
-            # ── Fallback ──────────────────────────────────────────────────────
-            log(f"   ⚠️ Всі методи вичерпано — повертаємо fallback")
+            log(f"   ⚠️ Всі методи вичерпано")
             return fallback
 
     except Exception as e:
